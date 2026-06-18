@@ -57,7 +57,11 @@
 (ert-deftest anvil-eval-server-execute-test-dontkill-left-alone ()
   "Abnormal unwind of a dontkill client leaves the connection alone."
   (anvil-eval-server-execute-test--with-open-process proc
-    (let (sent deleted)
+    (let ((sent nil) (deleted nil)
+          ;; `dontkill' sits at index 5 in this build's `server-execute'
+          ;; signature (proc files nowait commands evalexprs dontkill
+          ;; frame tty-name); pin the advice to read it there.
+          (anvil-eval--server-execute-dontkill-index 5))
       (cl-letf (((symbol-function 'process-send-string)
                  (lambda (_p s) (setq sent s)))
                 ((symbol-function 'delete-process)
@@ -65,7 +69,7 @@
         (catch 'abort
           (anvil-eval--server-execute-cleanup-advice
            (lambda (&rest _) (throw 'abort nil))
-           proc nil nil nil t nil nil)))   ; dontkill = t
+           proc nil nil nil nil t nil nil)))   ; dontkill = t at index 5
       (should-not sent)
       (should-not deleted))))
 
@@ -81,6 +85,30 @@
          (lambda (&rest _) (delete-process proc) 'done)
          proc nil nil nil nil nil nil))
       (should-not sent))))
+
+(ert-deftest anvil-eval-server-execute-test-normal-wait-client-untouched ()
+  "A wait-for-reply client that returns *normally* is left open.
+This is the `with-editor' / `pass edit' / `git commit' editor case:
+a frameless `emacsclient FILE' client returns from `server-execute'
+normally yet keeps its connection open so the user can edit.  The
+COMPLETED sentinel must suppress teardown — without it the bare
+`unwind-protect' cleanup fired on this normal return and killed the
+editor the instant it connected."
+  (anvil-eval-server-execute-test--with-open-process proc
+    (let ((sent nil) (deleted nil)
+          (anvil-eval--server-execute-dontkill-index 5))
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (_p s) (setq sent s)))
+                ((symbol-function 'delete-process)
+                 (lambda (p) (setq deleted p))))
+        ;; orig-fn returns normally and, like a waiting editor client,
+        ;; leaves the still-open connection in place.
+        (anvil-eval--server-execute-cleanup-advice
+         (lambda (&rest _) 'done)
+         proc nil nil nil nil nil nil nil))
+      (should-not sent)
+      (should-not deleted)
+      (should (eq (process-status proc) 'open)))))
 
 (provide 'anvil-eval-server-execute-test)
 ;;; anvil-eval-server-execute-test.el ends here

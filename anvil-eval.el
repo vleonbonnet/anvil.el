@@ -399,6 +399,14 @@ MCP Parameters: (none)"
 
 (declare-function server-quote-arg "server")
 
+(defvar anvil-eval--server-execute-dontkill-index 5
+  "Index of the `dontkill' argument within `server-execute's arglist.
+Computed from the live arglist by `anvil-eval-enable' because the
+signature has changed across Emacs versions and builds (e.g. stock
+Emacs has it at 4, this emacs-mac build at 5).  Used by
+`anvil-eval--server-execute-cleanup-advice' to identify the client
+class without hardcoding a position.")
+
 (defun anvil-eval--server-execute-cleanup-advice (orig-fn &rest args)
   "Guarantee emacsclient teardown when `server-execute' exits abnormally.
 Without this, a non-local exit during the eval body — e.g.
@@ -409,18 +417,28 @@ skips the reply / `server-delete-client' step at the end of
 receive its `-print' reply, hanging whatever owns it (for the MCP
 stdio transport, the anvil-stdio.sh bridge and its client).
 
-We wrap the call in an `unwind-protect': on abnormal unwind, if
-this looks like a wait-for-reply client (`dontkill' is nil and the
-connection is still open), synthesise an `-error' reply and tear
-the connection down so emacsclient can exit cleanly.  When
-`dontkill' is non-nil — `-window-system' / `-tty' / `-resume' /
-`-suspend' clients — we leave the connection alone, matching
+We wrap the call in an `unwind-protect' and only act on an
+*abnormal* unwind — tracked by the COMPLETED sentinel, set after
+`server-execute' returns normally.  This matters because an
+ordinary wait-for-reply editor client (a frameless `emacsclient
+FILE', as `with-editor'/`pass edit'/`git commit' spawn) returns
+from `server-execute' *normally* yet deliberately leaves its
+connection open so the user can edit; running the teardown on that
+normal return would kill the editor the instant it connects.  On a
+genuine abnormal unwind, if this looks like a wait-for-reply client
+(`dontkill' nil and the connection still open) we synthesise an
+`-error' reply and tear the connection down so emacsclient can exit
+cleanly.  When `dontkill' is non-nil — `-window-system' / `-tty' /
+`-resume' / `-suspend' clients — we leave it alone, matching
 upstream `server-execute' behaviour."
   (let ((proc (nth 0 args))
-        (dontkill (nth 4 args)))
+        (dontkill (nth anvil-eval--server-execute-dontkill-index args))
+        (completed nil))
     (unwind-protect
-        (apply orig-fn args)
-      (when (and (null dontkill)
+        (prog1 (apply orig-fn args)
+          (setq completed t))
+      (when (and (not completed)
+                 (null dontkill)
                  (processp proc)
                  (process-live-p proc)
                  (eq (process-status proc) 'open))
@@ -445,6 +463,10 @@ upstream `server-execute' behaviour."
   (advice-add 'org-mode :around #'anvil-eval--org-mode-fast-advice)
   (advice-add 'anvil-server-process-jsonrpc
               :around #'anvil-eval--request-mutex-advice)
+  (setq anvil-eval--server-execute-dontkill-index
+        (or (cl-position 'dontkill
+                         (help-function-arglist 'server-execute t))
+            anvil-eval--server-execute-dontkill-index))
   (advice-add 'server-execute
               :around #'anvil-eval--server-execute-cleanup-advice)
   ;; Register tools
