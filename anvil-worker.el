@@ -83,8 +83,9 @@ Pre-loading the common libraries the first real `:batch' tool
 call is likely to need amortises the cold-start `require' time so
 the user does not pay for it on the first dispatch.
 
-Each expression runs via `emacsclient -n -e' (fire-and-forget),
-so failures only surface in the worker's own *Messages* buffer."
+Each expression runs via `emacsclient -e' with `call-process'
+DESTINATION 0 (fire-and-forget), so failures only surface in the
+worker's own *Messages* buffer."
   :type '(repeat string)
   :group 'anvil-worker)
 
@@ -636,7 +637,6 @@ silently and the expressions are simply not sent."
           (sent '()))
       (dolist (expr anvil-worker-batch-warmup-expressions)
         (apply #'call-process "emacsclient" nil 0 nil
-               "-n"
                (append (anvil-worker--emacsclient-server-args server-file)
                        (list "-e" expr)))
         (push expr sent))
