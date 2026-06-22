@@ -553,32 +553,37 @@ The probe is run asynchronously via `make-process' and hard-killed
 after `anvil-worker-alive-check-timeout' seconds.  This prevents a
 stale SERVER-FILE pointing at a reused TCP port from blocking the
 caller indefinitely."
-  (let* ((buf (generate-new-buffer " *anvil-worker-probe*"))
-         (proc (make-process
-                :name "anvil-worker-probe"
-                :buffer buf
-                :command (append (list "emacsclient")
-                                 (anvil-worker--emacsclient-server-args
-                                  server-file)
-                                 (list "-e" "t"))
-                :noquery t
-                :connection-type 'pipe))
-         (deadline (+ (float-time) anvil-worker-alive-check-timeout))
-         (alive nil))
+  (let ((buf (generate-new-buffer " *anvil-worker-probe*"))
+        (proc nil)
+        (alive nil))
     (unwind-protect
-        (progn
+        (let ((deadline (+ (float-time) anvil-worker-alive-check-timeout)))
+          (setq proc (make-process
+                      :name "anvil-worker-probe"
+                      :buffer buf
+                      :command (append (list "emacsclient")
+                                       (anvil-worker--emacsclient-server-args
+                                        server-file)
+                                       (list "-e" "t"))
+                      :noquery t
+                      :connection-type 'pipe))
           (while (and (process-live-p proc)
                       (< (float-time) deadline))
             (accept-process-output proc 0.1 nil t))
           (if (process-live-p proc)
-              (progn
-                (delete-process proc)
-                (anvil-worker--log
-                 'probe-timeout
-                 (format "%s >%.1fs"
-                         (file-name-nondirectory server-file)
-                         anvil-worker-alive-check-timeout)))
+              (anvil-worker--log
+               'probe-timeout
+               (format "%s >%.1fs"
+                       (file-name-nondirectory server-file)
+                       anvil-worker-alive-check-timeout))
             (setq alive (= 0 (process-exit-status proc)))))
+      ;; Always release the probe's pipe fd and buffer.  `make-process' is
+      ;; inside the `unwind-protect' so an EMFILE failure still kills BUF;
+      ;; `delete-process' runs on the success path too (not just timeout) so
+      ;; the pipe slot returns to MS-Windows' 64-entry fd table (FD_SETSIZE)
+      ;; immediately — leaking one slot per probe exhausts it within an hour
+      ;; of health-check polling.
+      (when proc (delete-process proc))
       (when (buffer-live-p buf) (kill-buffer buf)))
     alive))
 
@@ -983,8 +988,16 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 ;;; Health check
 
 (defun anvil-worker--health-check-one (worker)
-  "Inspect WORKER and respawn it if it transitioned to dead."
-  (let ((alive (anvil-worker--worker-alive-p worker))
+  "Inspect WORKER and respawn it if it transitioned to dead.
+Uses the non-spawning `anvil-worker--quick-alive-p' (file + PID /
+`server-running-p') rather than the `emacsclient' probe: the sweep
+runs every `anvil-worker-health-check-interval' seconds against
+every worker, and spawning a probe each time is the dominant
+consumer of MS-Windows' 64-entry fd table.  A genuinely dead
+daemon fails the quick check (its PID no longer resolves); the
+authoritative `emacsclient' probe still runs on the dispatch path
+via `anvil-worker--pick-in-lane'."
+  (let ((alive (anvil-worker--quick-alive-p worker))
         (last  (plist-get worker :last-state))
         (name  (plist-get worker :name))
         (lane  (anvil-worker--lane-name (plist-get worker :lane))))
