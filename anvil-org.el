@@ -61,6 +61,7 @@
 ;;   org-agenda-view           :tree-walk       agenda generation in temp buffer
 ;;   org-habit-summary         :tree-walk       org-habit parsing in temp buffer
 ;;   org-capture-string        :tree-walk       invokes org-capture template
+;;   org-eval-babel            :tree-walk       executes a source block asynchronously
 ;;   org-update-todo-state     :tree-walk       writes via `org-todo' in buffer
 ;;   org-add-todo              :tree-walk       inserts heading + props in buffer
 ;;   org-rename-headline       :tree-walk       writes via `org-edit-headline'
@@ -78,8 +79,10 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'anvil-eval)
 (require 'anvil-server)
 (require 'org)
+(require 'ob-core)
 (require 'org-id)
 (require 'url-util)
 
@@ -265,6 +268,227 @@ the buffer"
 Check your Emacs hooks (`before-revert-hook', \
 `after-revert-hook', `revert-buffer-function')"
                 file-path (error-message-string err))))))))))
+
+(defun anvil-org--babel-positive-integer (value field)
+  "Return positive integer VALUE, or signal a validation error for FIELD."
+  (cond
+   ((null value) nil)
+   ((and (integerp value) (> value 0)) value)
+   ((and (stringp value)
+         (string-match-p "\\`[1-9][0-9]*\\'" (string-trim value)))
+    (string-to-number value))
+   (t
+    (anvil-org--tool-validation-error
+     "%s must be a positive integer, got: %s" field value))))
+
+(defun anvil-org--babel-normalize-block-name (name)
+  "Return trimmed Babel block NAME, or nil when NAME is absent."
+  (when name
+    (unless (stringp name)
+      (anvil-org--tool-validation-error
+       "block_name must be a string, got: %s" name))
+    (setq name (string-trim name))
+    (when (string-empty-p name)
+      (anvil-org--tool-validation-error
+       "block_name must not be empty"))
+    name))
+
+(defun anvil-org--babel-elements ()
+  "Return all source-block elements in the current Org buffer."
+  (org-element-map (org-element-parse-buffer) 'src-block #'identity))
+
+(defun anvil-org--babel-source-line (element)
+  "Return the #+begin_src line for source-block ELEMENT."
+  (save-excursion
+    (goto-char (org-element-property :begin element))
+    (if-let ((head (org-babel-where-is-src-block-head)))
+        (line-number-at-pos head)
+      (line-number-at-pos))))
+
+(defun anvil-org--babel-element-at-line (line)
+  "Return the source-block element containing positive LINE."
+  (let ((pos (save-excursion
+               (goto-char (point-min))
+               (forward-line (1- line))
+               (when (= (line-number-at-pos) line)
+                 (point)))))
+    (or (and pos
+             (cl-find-if
+              (lambda (element)
+                (let ((beg (org-element-property :begin element))
+                      (end (org-element-property :end element)))
+                  (and beg end (<= beg pos) (< pos end))))
+              (anvil-org--babel-elements)))
+        (anvil-org--tool-validation-error
+         "No Babel source block contains line %d" line))))
+
+(defun anvil-org--babel-element-named (name)
+  "Return the uniquely named Babel source block NAME in the current buffer."
+  (let ((matches
+         (cl-remove-if-not
+          (lambda (element)
+            (equal name (org-element-property :name element)))
+          (anvil-org--babel-elements))))
+    (cond
+     ((null matches)
+      (anvil-org--tool-validation-error
+       "Cannot find Babel block named %S" name))
+     ((cdr matches)
+      (anvil-org--tool-validation-error
+       "Babel block name %S is ambiguous in this file (found %d matches)"
+       name (length matches)))
+     (t
+      (car matches)))))
+
+(defun anvil-org--babel-files (&optional file)
+  "Return the allowed Org file list for optional FILE."
+  (if file
+      (let ((expanded (expand-file-name file)))
+        (unless (file-exists-p expanded)
+          (anvil-org--tool-validation-error
+           "Org file does not exist: %s" expanded))
+        (unless (anvil-org--find-allowed-file expanded)
+          (anvil-org--tool-file-access-error expanded))
+        (list expanded))
+    (anvil-org--org-files-for-tool nil)))
+
+(defun anvil-org--babel-target (&optional file line block-name)
+  "Resolve FILE/LINE or BLOCK-NAME to a validated Babel target plist."
+  (when (and file (not (stringp file)))
+    (anvil-org--tool-validation-error
+     "file must be a string, got: %s" file))
+  (when (and (stringp file) (string-empty-p (string-trim file)))
+    (setq file nil))
+  (let* ((line (anvil-org--babel-positive-integer line "line"))
+         (block-name (anvil-org--babel-normalize-block-name block-name))
+         (files (anvil-org--babel-files file)))
+    (when (and line block-name)
+      (anvil-org--tool-validation-error
+       "Pass either line or block_name, not both"))
+    (cond
+     (block-name
+      (let (matches)
+        (dolist (path files)
+          (with-temp-buffer
+            (insert-file-contents path)
+            ;; Name discovery is text-based so it does not initialize Org's
+            ;; element cache for every allowed file during an MCP call.
+            (when-let ((pos (org-babel-find-named-block block-name)))
+              (push (list :file path :line (line-number-at-pos pos))
+                    matches))))
+        (cond
+         ((null matches)
+          (anvil-org--tool-validation-error
+           "Cannot find Babel block named %S" block-name))
+         ((cdr matches)
+          (anvil-org--tool-validation-error
+           "Babel block name %S is ambiguous (found %d matches); pass file to disambiguate"
+           block-name (length matches)))
+         (t
+          (append (car matches) (list :block-name block-name))))))
+     (line
+      (unless file
+        (anvil-org--tool-validation-error
+         "file is required when line is provided"))
+      (with-temp-buffer
+        (insert-file-contents (car files))
+        (org-mode)
+        (anvil-org--babel-element-at-line line))
+      (list :file (car files) :line line))
+     (t
+      (anvil-org--tool-validation-error
+       "Provide block_name, or provide both file and line")))))
+
+(defun anvil-org--babel-check-buffer-changes (file)
+  "Allow buffer-only edits, but reject concurrent disk changes for FILE."
+  (dolist (buf (buffer-list))
+    (when (and (buffer-live-p buf)
+               (buffer-file-name buf)
+               (buffer-modified-p buf)
+               (anvil-org--paths-equal-p (buffer-file-name buf) file))
+      (with-current-buffer buf
+        (unless (and (visited-file-modtime)
+                     (verify-visited-file-modtime buf))
+          (anvil-org--tool-validation-error
+           "Cannot evaluate Babel block: buffer %s and disk both changed for %s"
+           (buffer-name buf) file))))))
+
+(defun anvil-org--babel-prepare-buffer (file)
+  "Return a no-display, disk-fresh buffer visiting FILE.
+Signal an error only when local and disk changes conflict.  A buffer
+with local-only changes is used as-is."
+  (anvil-org--babel-check-buffer-changes file)
+  (let ((buf (or (cl-find-if
+                  (lambda (candidate)
+                    (and (buffer-live-p candidate)
+                         (buffer-file-name candidate)
+                         (buffer-modified-p candidate)
+                         (anvil-org--paths-equal-p
+                          (buffer-file-name candidate) file)))
+                  (buffer-list))
+                 (find-file-noselect file t))))
+    (anvil-org--babel-check-buffer-changes file)
+    (with-current-buffer buf
+      (unless (buffer-modified-p)
+        (save-restriction
+          (widen)
+          (save-excursion
+            (revert-buffer t t t)))))
+    (anvil-org--babel-check-buffer-changes file)
+    buf))
+
+(defun anvil-org--babel-execute (file line block-name)
+  "Execute the Babel block selected by FILE, LINE, and BLOCK-NAME.
+This function runs inside an `emacs-eval-async' job."
+  (let ((buf (anvil-org--babel-prepare-buffer file)))
+    (with-current-buffer buf
+      (save-window-excursion
+        (save-restriction
+          (widen)
+          (save-excursion
+            (let* ((element (if block-name
+                                (anvil-org--babel-element-named block-name)
+                              (anvil-org--babel-element-at-line line))))
+              (goto-char (org-element-property :begin element))
+              (goto-char (or (org-babel-where-is-src-block-head)
+                             (point)))
+              (let* ((info (org-babel-get-src-block-info 'light element))
+                     (result (let ((org-confirm-babel-evaluate nil))
+                               (org-babel-execute-src-block
+                                nil info nil))))
+                (list :file file
+                      :line (anvil-org--babel-source-line element)
+                      :block-name (org-element-property :name element)
+                      :result result)))))))))
+
+(defun anvil-org--tool-eval-babel (&optional file line block_name)
+  "Start asynchronous execution of an Org Babel source block.
+
+MCP Parameters:
+  file - Absolute Org file path.  Required with LINE; optional with
+         BLOCK_NAME.  When omitted with BLOCK_NAME, Anvil searches the
+         allowed Org files and errors on ambiguous names.
+  line - 1-based line containing the source block.  The line may be
+         the #+name line, source header, body, or #+end_src line.
+  block_name - Named Babel source block.  Mutually exclusive with LINE.
+
+Returns the job ID string (for example, `job-12-1711843200').  Poll it with
+`emacs-eval-result'.  Before the job is queued and again when it starts,
+buffer-only unsaved changes are allowed, but a conflict where both buffer
+and disk changed is rejected.  Clean buffers are reverted from disk, and
+all buffer navigation is wrapped in `save-excursion'."
+  (let* ((target (anvil-org--babel-target file line block_name))
+         (path (plist-get target :file))
+         (target-line (plist-get target :line))
+         (target-name (plist-get target :block-name)))
+    (anvil-org--babel-check-buffer-changes path)
+    (let ((started
+           (anvil-eval--async
+            (prin1-to-string
+             `(anvil-org--babel-execute ,path ,target-line ,target-name)))))
+      (if (string-match "\\`Job started: \\(.*\\)\\'" started)
+          (match-string 1 started)
+        started))))
 
 (defun anvil-org--complete (file-path response-alist &optional no-save)
   "Create ID if needed, maybe save FILE-PATH, return JSON.
@@ -1071,47 +1295,47 @@ Throws validation error if AFTER-URI is invalid or sibling not found."
      "position=\"first\" is mutually exclusive with after_uri"))
   (if (equal position "first")
       (progn (org-back-to-heading t) (org-end-of-meta-data t))
-  (if (and after-uri (not (string-empty-p after-uri)))
-      (progn
-        ;; Parse afterUri to get the ID
-        (let ((after-id
-               (anvil-org--extract-uri-suffix
-                after-uri anvil-org--uri-id-prefix))
-              (found nil))
-          (unless after-id
-            (anvil-org--tool-validation-error
-             "Field after_uri is not %s: %s"
-             anvil-org--uri-id-prefix after-uri))
-          ;; Find the sibling with the specified ID
-          (org-back-to-heading t) ;; At parent
-          ;; Search sibling in parent's subtree
-          ;; Move to first child
-          (if (org-goto-first-child)
-              (progn
-                ;; Now search among siblings
-                (while (and (not found) (< (point) parent-end))
-                  (let ((current-id (org-entry-get nil "ID")))
-                    (when (string= current-id after-id)
-                      (setq found t)
-                      ;; Move to sibling end
-                      (org-end-of-subtree t t)))
-                  (unless found
-                    ;; Move to next sibling
-                    (unless (org-get-next-sibling)
-                      ;; No more siblings
-                      (goto-char parent-end)))))
-            ;; No children
-            (goto-char parent-end))
-          (unless found
-            (anvil-org--tool-validation-error
-             "Sibling with ID %s not found under parent"
-             after-id))))
-    ;; No after_uri - insert at end of parent's subtree
-    (org-end-of-subtree t t)
-    ;; If we're at the start of a sibling, go back one char
-    ;; to be at the end of parent's content
-    (when (looking-at "^\\*+ ")
-      (backward-char 1)))))
+    (if (and after-uri (not (string-empty-p after-uri)))
+        (progn
+          ;; Parse afterUri to get the ID
+          (let ((after-id
+                 (anvil-org--extract-uri-suffix
+                  after-uri anvil-org--uri-id-prefix))
+                (found nil))
+            (unless after-id
+              (anvil-org--tool-validation-error
+               "Field after_uri is not %s: %s"
+               anvil-org--uri-id-prefix after-uri))
+            ;; Find the sibling with the specified ID
+            (org-back-to-heading t) ;; At parent
+            ;; Search sibling in parent's subtree
+            ;; Move to first child
+            (if (org-goto-first-child)
+                (progn
+                  ;; Now search among siblings
+                  (while (and (not found) (< (point) parent-end))
+                    (let ((current-id (org-entry-get nil "ID")))
+                      (when (string= current-id after-id)
+                        (setq found t)
+                        ;; Move to sibling end
+                        (org-end-of-subtree t t)))
+                    (unless found
+                      ;; Move to next sibling
+                      (unless (org-get-next-sibling)
+                        ;; No more siblings
+                        (goto-char parent-end)))))
+              ;; No children
+              (goto-char parent-end))
+            (unless found
+              (anvil-org--tool-validation-error
+               "Sibling with ID %s not found under parent"
+               after-id))))
+      ;; No after_uri - insert at end of parent's subtree
+      (org-end-of-subtree t t)
+      ;; If we're at the start of a sibling, go back one char
+      ;; to be at the end of parent's content
+      (when (looking-at "^\\*+ ")
+        (backward-char 1)))))
 
 (defun anvil-org--ensure-newline ()
   "Ensure there is a newline or buffer start before point."
@@ -1378,10 +1602,10 @@ MCP Parameters:
          (headline-path (cdr parsed)))
     (anvil-org--validate-todo-state new_state)
     (anvil-org--modify file-path "update"
-                                `((previous_state
-                                   .
-                                   ,(or current_state ""))
-                                  (new_state . ,new_state))
+                       `((previous_state
+                          .
+                          ,(or current_state ""))
+                         (new_state . ,new_state))
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
 
@@ -1476,10 +1700,10 @@ MCP Parameters:
 
     ;; Add the TODO item
     (anvil-org--modify file-path "add TODO"
-                                `((file
-                                   .
-                                   ,(file-name-nondirectory file-path))
-                                  (title . ,title))
+                       `((file
+                          .
+                          ,(file-name-nondirectory file-path))
+                         (title . ,title))
       (let ((parent-level
              (anvil-org--navigate-to-parent-or-top
               parent-path parent-id)))
@@ -1623,8 +1847,8 @@ MCP Parameters:
 
     ;; Rename the headline in the file
     (anvil-org--modify file-path "rename"
-                                `((previous_title . ,current_title)
-                                  (new_title . ,new_title))
+                       `((previous_title . ,current_title)
+                         (new_title . ,new_title))
       ;; Navigate to the headline
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
@@ -2238,6 +2462,34 @@ Returns JSON object:
    :server-id anvil-org--server-id)
 
   (anvil-server-register-tool
+   #'anvil-org--tool-eval-babel
+   :id "org-eval-babel"
+   :intent '(org-eval eval)
+   :layer 'dev
+   :description
+   "Execute one Org Babel source block asynchronously.
+
+Parameters:
+  file - Absolute Org file path.  Required with line; optional with
+         block_name.  When omitted with block_name, Anvil searches the
+         allowed Org files and rejects ambiguous names.
+  line - 1-based line containing the source block.  The line may be
+         the #+name line, source header, body, or #+end_src line.
+  block_name - Named Babel source block.  Mutually exclusive with line.
+
+Before queuing and again before execution, allows buffer-only unsaved
+changes but rejects a conflict where both buffer and disk changed.  Clean
+buffers are reverted from disk.  Buffer navigation is saved, and the block
+runs with Babel confirmation disabled for noninteractive execution.
+
+Returns the job ID string.  Poll with emacs-eval-result.
+The block's normal Babel result handling still applies.
+
+Provide either block_name, or both file and line."
+   :read-only nil
+   :server-id anvil-org--server-id)
+
+  (anvil-server-register-tool
    #'anvil-org--tool-update-todo-state
    :id "org-update-todo-state"
    :intent '(org-edit)
@@ -2645,6 +2897,7 @@ Use this resource to:
   (anvil-server-unregister-tool "org-agenda-view" anvil-org--server-id)
   (anvil-server-unregister-tool "org-habit-summary" anvil-org--server-id)
   (anvil-server-unregister-tool "org-capture-string" anvil-org--server-id)
+  (anvil-server-unregister-tool "org-eval-babel" anvil-org--server-id)
   (anvil-server-unregister-tool
    "org-update-todo-state" anvil-org--server-id)
   (anvil-server-unregister-tool "org-add-todo" anvil-org--server-id)

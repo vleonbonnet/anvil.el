@@ -10,6 +10,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'anvil)
+(require 'anvil-eval)
 (require 'anvil-org)
 
 (defun anvil-org-test--with-temp-org (content fn)
@@ -41,6 +42,19 @@
              (make-string (/ body-len 2) (+ ?A (mod i 26)))))
    (number-sequence 1 count)
    ""))
+
+(defun anvil-org-test--wait-for-job (job-id)
+  "Wait for JOB-ID and return its result text."
+  (let ((deadline (+ (float-time) 10))
+        result)
+    (should (string-match-p "\\`job-" job-id))
+    (while (and (< (float-time) deadline)
+                (or (null result)
+                    (string-match-p "status: running" result)))
+      (setq result (anvil-eval--result job-id))
+      (when (string-match-p "status: running" result)
+        (accept-process-output nil 0.01)))
+    result))
 
 (ert-deftest anvil-org-test-modify-errors-do-not-prompt-on-kill ()
   "Failed modify tools must not ask to kill their temp file buffer."
@@ -301,42 +315,42 @@ no-ops in that case; the tool must detect the no-op and throw."
 (ert-deftest anvil-org-test-buffer-first-viable-returns-nil-by-default ()
   "`anvil--buffer-first-viable-p' returns nil when the mode list is nil."
   (anvil-org-test--with-temp-org "* Test\nBody."
-    (lambda (path)
-      (find-file-noselect path)
-      (unwind-protect
-          (should-not (anvil--buffer-first-viable-p path))
-        (kill-buffer (find-buffer-visiting path))))))
+                                 (lambda (path)
+                                   (find-file-noselect path)
+                                   (unwind-protect
+                                       (should-not (anvil--buffer-first-viable-p path))
+                                     (kill-buffer (find-buffer-visiting path))))))
 
 (ert-deftest anvil-org-test-buffer-first-viable-returns-cons-when-matching ()
   "`anvil--buffer-first-viable-p' returns a cons when the mode matches."
   (let ((anvil-modes-allow-buffer-modify '(org-mode)))
     (anvil-org-test--with-temp-org "* Test\nBody."
-      (lambda (path)
-        (find-file-noselect path)
-        (unwind-protect
-            (let ((result (anvil--buffer-first-viable-p path)))
-              (should result)
-              (should (bufferp (car result)))
-              (should-not (cdr result)))
-          (kill-buffer (find-buffer-visiting path)))))))
+                                   (lambda (path)
+                                     (find-file-noselect path)
+                                     (unwind-protect
+                                         (let ((result (anvil--buffer-first-viable-p path)))
+                                           (should result)
+                                           (should (bufferp (car result)))
+                                           (should-not (cdr result)))
+                                       (kill-buffer (find-buffer-visiting path)))))))
 
 (ert-deftest anvil-org-test-buffer-first-viable-detects-modified ()
   "`anvil--buffer-first-viable-p' correctly reports modified state."
   (let ((anvil-modes-allow-buffer-modify '(org-mode)))
     (anvil-org-test--with-temp-org "* Test\nBody."
-      (lambda (path)
-        (let ((buf (find-file-noselect path)))
-          (unwind-protect
-              (progn
-                (with-current-buffer buf
-                  (insert "unsaved change")
-                  (let ((result (anvil--buffer-first-viable-p path)))
-                    (should result)
-                    (should (eq buf (car result)))
-                    (should (cdr result))))
-                (with-current-buffer buf
-                  (set-buffer-modified-p nil)))
-            (kill-buffer buf)))))))
+                                   (lambda (path)
+                                     (let ((buf (find-file-noselect path)))
+                                       (unwind-protect
+                                           (progn
+                                             (with-current-buffer buf
+                                               (insert "unsaved change")
+                                               (let ((result (anvil--buffer-first-viable-p path)))
+                                                 (should result)
+                                                 (should (eq buf (car result)))
+                                                 (should (cdr result))))
+                                             (with-current-buffer buf
+                                               (set-buffer-modified-p nil)))
+                                         (kill-buffer buf)))))))
 
 (ert-deftest anvil-org-test-buffer-first-preserves-unsaved-modifications ()
   "Buffer-first editing does NOT save when the buffer was already modified."
@@ -352,7 +366,7 @@ no-ops in that case; the tool must detect the no-op and throw."
                  (goto-char (point-max))
                  (insert "User's unsaved work."))
                (anvil-org--modify path "update"
-                   '((previous_state . "") (new_state . "DONE"))
+                                  '((previous_state . "") (new_state . "DONE"))
                  (goto-char (point-min))
                  (org-todo "DONE"))
                (with-current-buffer buf
@@ -380,7 +394,7 @@ no-ops in that case; the tool must detect the no-op and throw."
              (let ((anvil-org-allowed-files (list path))
                    (anvil-org-allowed-files-enabled t))
                (anvil-org--modify path "update"
-                   '((previous_state . "") (new_state . "DONE"))
+                                  '((previous_state . "") (new_state . "DONE"))
                  (goto-char (point-min))
                  (org-todo "DONE"))
                (with-current-buffer buf
@@ -397,13 +411,13 @@ no-ops in that case; the tool must detect the no-op and throw."
   "`fundamental-mode' in the mode list matches org-mode buffers."
   (let ((anvil-modes-allow-buffer-modify '(fundamental-mode)))
     (anvil-org-test--with-temp-org "* Test\nBody."
-      (lambda (path)
-        (find-file-noselect path)
-        (unwind-protect
-            (let ((result (anvil--buffer-first-viable-p path)))
-              (should result)
-              (should (bufferp (car result))))
-          (kill-buffer (find-buffer-visiting path)))))))
+                                   (lambda (path)
+                                     (find-file-noselect path)
+                                     (unwind-protect
+                                         (let ((result (anvil--buffer-first-viable-p path)))
+                                           (should result)
+                                           (should (bufferp (car result))))
+                                       (kill-buffer (find-buffer-visiting path)))))))
 
 (ert-deftest anvil-org-test-capture-string-static-target ()
   "org-capture-string invokes a validated static file template."
@@ -457,25 +471,130 @@ no-ops in that case; the tool must detect the no-op and throw."
        ;; deterministic regardless of the real date.
        (cl-letf (((symbol-function 'current-time)
                   (lambda (&rest _) fixed-now)))
-        (let* ((response
-               (json-parse-string
-                (anvil-org--tool-habit-summary nil "2026-05-25")
-                :object-type 'alist
-                :array-type 'list))
-              (habits (alist-get 'habits response))
-              (habit (car habits)))
-         ;; org-habit's row math depends on the org version Emacs ships.  The
-         ;; org-habit in Emacs 29.4 (org 9.6) builds an incomplete row for this
-         ;; fixture, which anvil-org--collect-habits-in-file surfaces as an
-         ;; error entry; skip the strong assertions there rather than fail.
-         ;; Emacs 30.1 (org 9.7+) exercises the full path.  (Follow-up: make
-         ;; anvil-org--habit-row resilient across org-habit versions.)
-         (skip-unless (null (alist-get 'error habit)))
-         (should (= 1 (alist-get 'count response)))
-         (should (equal "Drink water" (alist-get 'title habit)))
-         (should (equal "habit-id" (alist-get 'id habit)))
-         (should (= 2 (alist-get 'streak habit)))
-         (should (equal "alert" (alist-get 'status habit)))
-         (should (> (alist-get 'completion_ratio habit) 0.0))))))))
+         (let* ((response
+                 (json-parse-string
+                  (anvil-org--tool-habit-summary nil "2026-05-25")
+                  :object-type 'alist
+                  :array-type 'list))
+                (habits (alist-get 'habits response))
+                (habit (car habits)))
+           ;; org-habit's row math depends on the org version Emacs ships.  The
+           ;; org-habit in Emacs 29.4 (org 9.6) builds an incomplete row for this
+           ;; fixture, which anvil-org--collect-habits-in-file surfaces as an
+           ;; error entry; skip the strong assertions there rather than fail.
+           ;; Emacs 30.1 (org 9.7+) exercises the full path.  (Follow-up: make
+           ;; anvil-org--habit-row resilient across org-habit versions.)
+           (skip-unless (null (alist-get 'error habit)))
+           (should (= 1 (alist-get 'count response)))
+           (should (equal "Drink water" (alist-get 'title habit)))
+           (should (equal "habit-id" (alist-get 'id habit)))
+           (should (= 2 (alist-get 'streak habit)))
+           (should (equal "alert" (alist-get 'status habit)))
+           (should (> (alist-get 'completion_ratio habit) 0.0))))))))
+
+(ert-deftest anvil-org-test-eval-babel-by-name-returns-async-result ()
+  "Named Babel blocks execute through the shared async job store."
+  (anvil-org-test--with-temp-org
+   "#+name: anvil-test-babel\n#+begin_src emacs-lisp :results silent\n(+ 2 3)\n#+end_src\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (org-confirm-babel-evaluate t)
+           (buf nil))
+       (unwind-protect
+           (let* ((job-start (anvil-org--tool-eval-babel
+                              nil nil "anvil-test-babel"))
+                  (result (anvil-org-test--wait-for-job job-start)))
+             (should (string-match-p "status: done" result))
+             (should (string-match-p ":result 5" result))
+             (setq buf (find-buffer-visiting path)))
+         (when (buffer-live-p buf)
+           (kill-buffer buf)))))))
+
+(ert-deftest anvil-org-test-babel-name-lookup-does-not-enter-org-mode ()
+  "Name-only lookup must not initialize Org for every allowed file."
+  (anvil-org-test--with-temp-org
+   "#+name: anvil-test-babel\n#+begin_src emacs-lisp :results silent\n(+ 2 3)\n#+end_src\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t))
+       (cl-letf (((symbol-function 'org-mode)
+                  (lambda (&rest _args)
+                    (error "unexpected org-mode initialization"))))
+         (let ((target (anvil-org--babel-target nil nil "anvil-test-babel")))
+           (should (equal path (plist-get target :file)))
+           (should (equal "anvil-test-babel"
+                          (plist-get target :block-name)))))))))
+
+(ert-deftest anvil-org-test-eval-babel-by-line-preserves-point ()
+  "Line-based Babel execution reverts clean buffers without moving point."
+  (anvil-org-test--with-temp-org
+   "#+name: anvil-test-babel\n#+begin_src emacs-lisp :results silent\n(+ 2 3)\n#+end_src\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (org-confirm-babel-evaluate nil)
+           (buf (find-file-noselect path t)))
+       (unwind-protect
+           (with-current-buffer buf
+             (goto-char (point-max))
+             (let ((original-point (point)) result)
+               (cl-letf (((symbol-function 'y-or-n-p)
+                          (lambda (&rest _args)
+                            (error "unexpected interactive file prompt"))))
+                 (setq result (anvil-org--babel-execute path 3 nil)))
+               (should (= 5 (plist-get result :result)))
+               (should (= 2 (plist-get result :line)))
+               (should (= original-point (point)))))
+         (kill-buffer buf))))))
+
+(ert-deftest anvil-org-test-eval-babel-allows-buffer-only-changes ()
+  "Babel execution uses unsaved buffer content when disk is unchanged."
+  (anvil-org-test--with-temp-org
+   "#+name: anvil-test-babel\n#+begin_src emacs-lisp :results silent\n(+ 2 3)\n#+end_src\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (buf (find-file-noselect path t)))
+       (unwind-protect
+           (with-current-buffer buf
+             (goto-char (point-max))
+             (insert "unsaved local change")
+             (let ((result
+                    (anvil-org-test--wait-for-job
+                     (anvil-org--tool-eval-babel path "3" nil))))
+               (should (string-match-p "status: done" result))
+               (should (string-match-p ":result 5" result)))
+             (should (buffer-modified-p))
+             (should (string-match-p
+                      "unsaved local change"
+                      (buffer-string))))
+         (with-current-buffer buf
+           (set-buffer-modified-p nil))
+         (kill-buffer buf))))))
+
+(ert-deftest anvil-org-test-eval-babel-rejects-buffer-disk-conflict ()
+  "Babel execution rejects a buffer changed alongside its file on disk."
+  (anvil-org-test--with-temp-org
+   "#+name: anvil-test-babel\n#+begin_src emacs-lisp :results silent\n(+ 2 3)\n#+end_src\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (buf (find-file-noselect path t)))
+       (unwind-protect
+           (with-current-buffer buf
+             (goto-char (point-max))
+             (insert "unsaved local change")
+             (set-file-times path (time-add (current-time) 10))
+             (should-error
+              (anvil-org--tool-eval-babel path "3" nil)
+              :type 'anvil-server-tool-error)
+             (should (buffer-modified-p))
+             (should (string-match-p
+                      "unsaved local change"
+                      (buffer-string))))
+         (with-current-buffer buf
+           (set-buffer-modified-p nil))
+         (kill-buffer buf))))))
 
 ;;; anvil-org-test.el ends here
