@@ -442,8 +442,10 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
              (let* ((res (anvil-file-replace-string path "beta" "BETA"))
                     (ws  (plist-get res :warnings)))
                (should (= 1 (plist-get res :replaced)))
-               (should (= 1 (length ws)))
+               ;; Pre-write divergence + post-write not-resynced report.
+               (should (= 2 (length ws)))
                (should (string-match-p "buffer-newer" (car ws)))
+               (should (string-match-p "not resynced" (cadr ws)))
                (should (equal "alpha BETA gamma\n"
                               (anvil-file-test--read path)))))
          (anvil-file-test--discard-buffer buf))))))
@@ -451,10 +453,11 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
 ;;;; --- Phase 2 full: :warnings embedded in all mutating tools --------------
 
 (defmacro anvil-file-test--expect-warning (form)
-  "Assert FORM's plist result includes a `buffer-newer' :warnings entry."
+  "Assert FORM's :warnings pairs `buffer-newer' with a not-resynced report."
   `(let ((ws (plist-get ,form :warnings)))
-     (should (= 1 (length ws)))
-     (should (string-match-p "buffer-newer" (car ws)))))
+     (should (= 2 (length ws)))
+     (should (string-match-p "buffer-newer" (car ws)))
+     (should (string-match-p "not resynced" (cadr ws)))))
 
 (ert-deftest anvil-file-test-phase2-replace-regexp-warnings ()
   (anvil-file-test--with-tmp
@@ -1147,5 +1150,64 @@ Uses a fixture whose target line is already on disk so no write fires."
      (let ((out (anvil-file--tool-create path "second\n" "1")))
        (should (string-match-p ":bytes 7" out))
        (should (equal (anvil-file-test--read path) "second\n"))))))
+
+;;;; --- post-write buffer resync ---------------------------------------------
+
+(ert-deftest anvil-file-test-replace-string-resyncs-visited-buffer ()
+  "A clean visited buffer follows disk across successive raw writes."
+  (anvil-file-test--with-tmp
+   "alpha beta\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (let ((res (anvil-file-replace-string path "beta" "gamma")))
+               (should (null (plist-get res :warnings))))
+             (should (equal "alpha gamma\n"
+                            (with-current-buffer buf (buffer-string))))
+             ;; Second edit sees an in-sync buffer — still no warnings.
+             (let ((res (anvil-file-replace-string path "alpha" "delta")))
+               (should (null (plist-get res :warnings))))
+             (should (equal "delta gamma\n"
+                            (with-current-buffer buf (buffer-string))))
+             (should-not (buffer-modified-p buf)))
+         (anvil-file-test--discard-buffer buf))))))
+
+(ert-deftest anvil-file-test-replace-string-keeps-modified-buffer ()
+  "Unsaved buffer edits survive a raw write; both states are warned about."
+  (anvil-file-test--with-tmp
+   "alpha beta\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf
+               (goto-char (point-max))
+               (insert "unsaved\n"))
+             (let ((res (anvil-file-replace-string path "beta" "gamma")))
+               ;; Pre-write buffer-newer warning + post-write skip warning.
+               (should (= 2 (length (plist-get res :warnings)))))
+             (should (equal "alpha gamma\n" (anvil-file-test--read path)))
+             (should (string-match-p
+                      "unsaved"
+                      (with-current-buffer buf (buffer-string)))))
+         (anvil-file-test--discard-buffer buf))))))
+
+(ert-deftest anvil-file-test-batch-resyncs-visited-buffer ()
+  "file-batch's single write leaves the visited buffer in sync."
+  (anvil-file-test--with-tmp
+   "one\ntwo\nthree\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (let ((res (anvil-file-batch
+                         path
+                         '(((op . "replace") (old . "one") (new . "ichi"))
+                           ((op . "replace") (old . "three") (new . "san"))))))
+               (should (null (plist-get res :warnings))))
+             (should (equal "ichi\ntwo\nsan\n"
+                            (with-current-buffer buf (buffer-string)))))
+         (anvil-file-test--discard-buffer buf))))))
 
 ;;; anvil-file-test.el ends here

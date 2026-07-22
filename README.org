@@ -782,6 +782,25 @@ edits.
 (setq anvil-modes-allow-buffer-modify '(fundamental-mode))
 #+end_src
 
+** Post-write buffer resync — anvil-disk-resync-after-write
+
+The generic =file-*= editing tools (=file-replace-string=,
+=file-batch=, =file-insert-at-line=, …) always write to disk through
+a temporary buffer, never through a visited buffer.  When the target
+file happens to be open in Emacs, each write used to leave that
+buffer stale (status =disk-newer=), forcing the caller to revert it
+manually between edits or risk Emacs's supersession prompt.
+
+Since the write-after-edit resync shipped, every =file-*= disk write
+automatically reverts a *clean* visiting buffer so it matches the new
+disk content — narrowing preserved, modes preserved.  A buffer with
+unsaved edits is never touched; the skip is reported in the tool's
+=:warnings= alongside the usual divergence warnings.  Intentionally
+stale buffers (=visited-file-modtime= of 0) are also left alone.
+
+Set =anvil-disk-resync-after-write= to =nil= to restore the old
+warn-only behavior.
+
 ** User config — Emacs vs NeLisp standalone
 
 Two entry paths, two config locations:

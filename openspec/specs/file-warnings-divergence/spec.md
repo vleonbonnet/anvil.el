@@ -18,9 +18,11 @@ name family (such as `file-read`, `file-replace-string`,
 SHALL return a plist that includes a `:warnings` field. The field
 SHALL be a list, possibly empty. An empty list indicates that no
 disk/buffer divergence was detected for the target file at the time
-of the call. A non-empty list indicates detected divergence, with at
-least one entry identifying the detected divergence kind (for example
-buffer-newer, disk-newer, both-modified, or unknown).
+of the call and that any post-write buffer resync (see the resync
+requirement below) completed without incident. A non-empty list
+indicates detected divergence or a resync incident, with at least
+one entry identifying the condition (for example buffer-newer,
+disk-newer, both-modified, unknown, or a not-resynced report).
 
 #### Scenario: External edit on an open buffer surfaces a warning
 
@@ -49,6 +51,39 @@ here.
 - **THEN** the disk content reflects the replacement
 - **AND** the returned plist still includes a non-empty `:warnings`
   entry describing the divergence
+
+### Requirement: After a write, a clean visiting buffer MUST be resynced to disk
+
+When a mutating `file-*` tool has written a file that is visited by
+a buffer with no unsaved modifications, the tool SHALL revert that
+buffer so its content, modified flag, and recorded modtime match the
+new disk state before the tool returns. A buffer with unsaved
+modifications SHALL NOT be reverted; instead the result's
+`:warnings` SHALL include an entry reporting that the buffer was not
+resynced. A buffer whose recorded modtime is the intentional-stale
+sentinel (zero) SHALL NOT be reverted and SHALL NOT produce a resync
+warning. A failed revert SHALL be reported via `:warnings`, not by
+signaling an error, because the disk write has already succeeded.
+The whole behavior MAY be disabled via a user option
+(`anvil-disk-resync-after-write`), restoring warn-only semantics.
+
+#### Scenario: Successive edits to an open file need no manual revert
+
+- **GIVEN** a file visited by an Emacs buffer with no unsaved changes
+- **WHEN** a client calls `file-replace-string` on that file twice in
+  a row
+- **THEN** after each call the visiting buffer's content equals the
+  disk content
+- **AND** both calls return an empty `:warnings` list
+
+#### Scenario: Unsaved user edits survive the write
+
+- **GIVEN** a file visited by an Emacs buffer with unsaved changes
+- **WHEN** a client calls a mutating `file-*` tool on that file
+- **THEN** the disk content reflects the tool's edit
+- **AND** the buffer still contains the unsaved user changes
+- **AND** the returned `:warnings` reports both the divergence and
+  that the buffer was not resynced
 
 ## Non-goals
 

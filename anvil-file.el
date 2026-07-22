@@ -14,7 +14,9 @@
 ;;   3. Claude が毎回 with-temp-buffer + insert-file-contents を書かずに済む
 ;;
 ;; 全ての file-* helper は `with-temp-buffer' + `insert-file-contents' +
-;; `write-region' パターン (buffer 副作用なし、auto-revert への影響なし)。
+;; `write-region' パターン (visited buffer は編集に使わない)。書き込み後、
+;; clean な visited buffer は `anvil-file-resync-buffer' で disk 内容に
+;; 自動 revert される (doc 05 disk-first の write-after-edit policy)。
 ;;
 ;; 命名規約:
 ;;   anvil-file-*  汎用ファイル編集 (任意の text file)
@@ -62,9 +64,13 @@
 
 (defun anvil--write-current-buffer-to (path)
   "Write current temp buffer content to PATH atomically.
-Uses `write-region' with VISIT nil so no buffer is created."
+Uses `write-region' with VISIT nil so no buffer is created.
+Afterwards a clean buffer visiting PATH is reverted to the new
+disk content (see `anvil-file-resync-buffer').  Returns that
+resync's warning list; callers surface it under `:warnings'."
   (let ((coding-system-for-write 'utf-8-unix))
-    (write-region (point-min) (point-max) path nil 'silent)))
+    (write-region (point-min) (point-max) path nil 'silent))
+  (anvil-file-resync-buffer path))
 
 (defun anvil--insert-file (path)
   "Insert PATH into current buffer with UTF-8 forced.
@@ -299,7 +305,8 @@ PATTERN capture groups use Emacs regexp syntax `\\(...\\)'.
 REPLACEMENT may use \\1 \\2 etc. for capture groups.
 Returns (:replaced N :file PATH :warnings LIST).  Errors if 0
 replacements were made.  :warnings surfaces pre-write divergence
-with any visited buffer (see `anvil-file-warn-if-diverged')."
+with any visited buffer (see `anvil-file-warn-if-diverged') plus
+post-write resync warnings (see `anvil-file-resync-buffer')."
   (let* ((abs (anvil--prepare-path path))
          (warnings (anvil-file-warn-if-diverged abs))
          (count 0))
@@ -312,7 +319,7 @@ with any visited buffer (see `anvil-file-warn-if-diverged')."
         (cl-incf count))
       (when (zerop count)
         (error "my-cc: pattern not found in %s: %s" abs pattern))
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :replaced count :file abs :warnings warnings)))
 
 (defun anvil-file-replace-string (path old-string new-string &optional max-count)
@@ -322,11 +329,12 @@ Returns (:replaced N :file PATH :warnings LIST).  Errors if 0
 replacements were made.  Pass MAX-COUNT 1 to assert exactly-one
 match (will still error on 0).
 
-:warnings is computed *before* the disk write from
-`anvil-file-warn-if-diverged'.  It flags the case where a visited
-buffer has unsaved edits, so the caller can choose to refresh the
-buffer or abort a follow-up action; the disk write itself is not
-refused (disk-first contract)."
+:warnings merges pre-write divergence from
+`anvil-file-warn-if-diverged' with post-write resync warnings
+from `anvil-file-resync-buffer'.  The disk write itself is never
+refused (disk-first contract); after it, a clean visited buffer
+is automatically reverted to match disk, and a buffer with
+unsaved edits is left alone and reported in :warnings."
   (let* ((abs (anvil--prepare-path path))
          (warnings (anvil-file-warn-if-diverged abs))
          (count 0))
@@ -339,7 +347,7 @@ refused (disk-first contract)."
         (cl-incf count))
       (when (zerop count)
         (error "my-cc: string not found in %s: %s" abs old-string))
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :replaced count :file abs :warnings warnings)))
 
 (defun anvil-file-insert-at-line (path line content)
@@ -356,7 +364,7 @@ Returns (:line LINE :inserted-bytes N :file PATH :warnings LIST)."
       (goto-char (point-min))
       (forward-line (1- line))
       (insert text)
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :line line :inserted-bytes (length text)
           :file abs :warnings warnings)))
 
@@ -375,7 +383,7 @@ Returns (:deleted N :file PATH :warnings LIST)."
       (let ((beg (point)))
         (forward-line deleted)
         (delete-region beg (point)))
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :deleted deleted :file abs :warnings warnings)))
 
 (defun anvil-file-append (path content)
@@ -395,7 +403,7 @@ Returns (:appended-bytes N :file PATH :warnings LIST)."
       (let ((before (point)))
         (insert content)
         (setq bytes (- (point) before)))
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :appended-bytes bytes :file abs :warnings warnings)))
 
 (defun anvil-file-prepend (path content)
@@ -411,15 +419,16 @@ Returns (:prepended-bytes N :file PATH :warnings LIST)."
       (anvil--insert-file abs)
       (goto-char (point-min))
       (insert text)
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :prepended-bytes (length text) :file abs :warnings warnings)))
 
 (defun anvil-file-create (path content &optional overwrite)
   "Create new file at PATH with CONTENT.
 Errors if file exists unless OVERWRITE is non-nil.
 Parent directory must exist (will not be created automatically).
-Returns (:created PATH :bytes N)."
-  (let ((abs (expand-file-name path)))
+Returns (:created PATH :bytes N :warnings LIST)."
+  (let ((abs (expand-file-name path))
+        warnings)
     (when (and (file-exists-p abs) (not overwrite))
       (error "my-cc: file exists: %s (pass overwrite to replace)" abs))
     (let ((dir (file-name-directory abs)))
@@ -427,8 +436,8 @@ Returns (:created PATH :bytes N)."
         (error "my-cc: parent directory does not exist: %s" dir)))
     (with-temp-buffer
       (insert content)
-      (anvil--write-current-buffer-to abs))
-    (list :created abs :bytes (length content))))
+      (setq warnings (anvil--write-current-buffer-to abs)))
+    (list :created abs :bytes (length content) :warnings warnings)))
 
 ;;;; --- org: structural edits ----------------------------------------------
 
@@ -455,9 +464,10 @@ HEADING-PATH is a list of heading title strings from outermost to innermost,
 e.g. (\"Top Level\" \"Section\" \"Leaf\").
 The body is the content between the heading line (and its property drawer,
 if any) and the next heading. Subheadings are preserved.
-Returns (:file PATH :heading HEADING-PATH)."
+Returns (:file PATH :heading HEADING-PATH :warnings LIST)."
   (require 'org)
-  (let ((abs (anvil--prepare-path path)))
+  (let ((abs (anvil--prepare-path path))
+        warnings)
     (with-temp-buffer
       (anvil--insert-file abs)
       (delay-mode-hooks (org-mode))
@@ -477,17 +487,17 @@ Returns (:file PATH :heading HEADING-PATH)."
         (insert new-body)
         (unless (string-suffix-p "\n" new-body)
           (insert "\n")))
-      (anvil--write-current-buffer-to abs))
-    (list :file abs :heading heading-path)))
+      (setq warnings (anvil--write-current-buffer-to abs)))
+    (list :file abs :heading heading-path :warnings warnings)))
 
 (defun anvil-org-append-to-heading (path heading-path content)
   "In org file PATH, append CONTENT after the existing body of heading at
 HEADING-PATH (before any subheadings). Useful for adding new MEMO entries
 to a NOTE section without disturbing existing content.
-Returns (:file PATH :heading HEADING-PATH :appended-bytes N)."
+Returns (:file PATH :heading HEADING-PATH :appended-bytes N :warnings LIST)."
   (require 'org)
   (let ((abs (anvil--prepare-path path))
-        bytes)
+        bytes warnings)
     (with-temp-buffer
       (anvil--insert-file abs)
       (delay-mode-hooks (org-mode))
@@ -509,8 +519,9 @@ Returns (:file PATH :heading HEADING-PATH :appended-bytes N)."
         (unless (string-suffix-p "\n" content)
           (insert "\n"))
         (setq bytes (- (point) before)))
-      (anvil--write-current-buffer-to abs))
-    (list :file abs :heading heading-path :appended-bytes bytes)))
+      (setq warnings (anvil--write-current-buffer-to abs)))
+    (list :file abs :heading heading-path :appended-bytes bytes
+          :warnings warnings)))
 
 (defun anvil-journal--default-file (date)
   "Return the default journals-YYYY.org path for DATE (\"YYYY-MM-DD\")."
@@ -543,7 +554,7 @@ BODY is inserted unchanged. Convention: indent each bullet line with
 
 Returns:
   (:file PATH :date DATE :memo-title TITLE :inner-section-existed BOOL
-   :appended-bytes N)
+   :appended-bytes N :warnings LIST)
 
 Errors with `(error \"my-cc: ...\")' on missing top-level headline."
   (require 'org)
@@ -560,7 +571,7 @@ Errors with `(error \"my-cc: ...\")' on missing top-level headline."
              (format "*** MEMO AI: %s <%s %s>\n" memo-title date suffix)
              body
              (if (string-suffix-p "\n" body) "" "\n"))))
-         inner-existed inner-suffix bytes)
+         inner-existed inner-suffix bytes warnings)
     (with-temp-buffer
       (anvil--insert-file abs)
       (delay-mode-hooks (org-mode))
@@ -606,13 +617,14 @@ Errors with `(error \"my-cc: ...\")' on missing top-level headline."
             (insert (format "** NOTE 作業ログ <%s %s>\n" date inner-suffix))
             (insert (funcall build-memo inner-suffix))
             (setq bytes (- (point) before))))))
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (anvil--write-current-buffer-to abs)))
     (list :file                  abs
           :date                  date
           :memo-title            memo-title
           :inner-section-existed (and inner-existed t)
           :inner-suffix          inner-suffix
-          :appended-bytes        bytes)))
+          :appended-bytes        bytes
+          :warnings              warnings)))
 
 (defun anvil-org-headlines (path &optional filter)
   "Return a list of headline plists for org file PATH.
@@ -907,10 +919,10 @@ Returns same plist format as `anvil-org-read-headline'."
   "Add a new headline TITLE under PARENT-PATH in org file PATH.
 PARENT-PATH is a list of ancestor title strings, or nil for top-level.
 OPTS plist: :todo STATE, :tags (list of strings), :body TEXT.
-Returns (:file PATH :heading-path <list> :title TITLE)."
+Returns (:file PATH :heading-path <list> :title TITLE :warnings LIST)."
   (require 'org)
   (let ((abs (anvil--prepare-path path))
-        new-level heading-path)
+        new-level heading-path warnings)
     (with-temp-buffer
       (anvil--insert-file abs)
       (delay-mode-hooks (org-mode))
@@ -944,12 +956,13 @@ Returns (:file PATH :heading-path <list> :title TITLE)."
       (setq heading-path (if parent-path
                              (append parent-path (list title))
                            (list title)))
-      (anvil--write-current-buffer-to abs))
-    (list :file abs :heading-path heading-path :title title)))
+      (setq warnings (anvil--write-current-buffer-to abs)))
+    (list :file abs :heading-path heading-path :title title
+          :warnings warnings)))
 
 (defun anvil-org-rename-headline (path heading-path new-title)
   "Rename heading at HEADING-PATH to NEW-TITLE in org file PATH.
-Returns (:file PATH :old-title OLD :new-title NEW-TITLE)."
+Returns (:file PATH :old-title OLD :new-title NEW-TITLE :warnings LIST)."
   (require 'org)
   (let ((abs (anvil--prepare-path path)))
     (with-temp-buffer
@@ -959,13 +972,15 @@ Returns (:file PATH :old-title OLD :new-title NEW-TITLE)."
         (error "my-cc: heading not found in %s: %S" abs heading-path))
       (let ((old-title (org-get-heading t t t t)))
         (org-edit-headline new-title)
-        (anvil--write-current-buffer-to abs)
-        (list :file abs :old-title old-title :new-title new-title)))))
+        (let ((warnings (anvil--write-current-buffer-to abs)))
+          (list :file abs :old-title old-title :new-title new-title
+                :warnings warnings))))))
 
 (defun anvil-org-update-todo-state (path heading-path new-state)
   "Set TODO state of heading at HEADING-PATH to NEW-STATE in org file PATH.
 NEW-STATE is a string like \"TODO\", \"DONE\", or \"\" to clear.
-Returns (:file PATH :heading TITLE :old-state OLD :new-state NEW-STATE)."
+Returns (:file PATH :heading TITLE :old-state OLD :new-state NEW-STATE
+:warnings LIST)."
   (require 'org)
   (let ((abs (anvil--prepare-path path)))
     (with-temp-buffer
@@ -979,9 +994,10 @@ Returns (:file PATH :heading TITLE :old-state OLD :new-state NEW-STATE)."
               (org-log-done nil)
               (org-log-repeat nil))
           (org-todo (if (string-empty-p new-state) 'none new-state)))
-        (anvil--write-current-buffer-to abs)
-        (list :file abs :heading title
-              :old-state old-state :new-state new-state)))))
+        (let ((warnings (anvil--write-current-buffer-to abs)))
+          (list :file abs :heading title
+                :old-state old-state :new-state new-state
+                :warnings warnings))))))
 
 ;;;; --- elisp dev helpers --------------------------------------------------
 
@@ -1334,7 +1350,8 @@ MCP Parameters:
 OPERATIONS is a list of alists, each with an `op' key and operation-specific
 keys.  All operations run on the same buffer; the file is written once at end.
 Returns (:ok t :operations N :file PATH :warnings LIST) on success.
-:warnings surfaces pre-write divergence with any visited buffer."
+:warnings surfaces pre-write divergence with any visited buffer
+plus post-write resync warnings (see `anvil-file-resync-buffer')."
   (let* ((abs (anvil--prepare-path path))
          (warnings (anvil-file-warn-if-diverged abs))
          (op-count 0))
@@ -1406,7 +1423,7 @@ Returns (:ok t :operations N :file PATH :warnings LIST) on success.
               "batch: unknown op %S (supported: replace, replace-regexp, insert-at-line, delete-lines, append, prepend)"
               type))))
         (cl-incf op-count))
-      (anvil--write-current-buffer-to abs))
+      (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
     (list :ok t :operations op-count :file abs :warnings warnings)))
 
 (defun anvil-file--tool-batch (path operations)
@@ -1510,13 +1527,15 @@ trailing comma on the previous last entry is added automatically; new
 entries get trailing commas except the last one (to conform with strict
 JSON parsers).
 
-Returns plist (:added N :skipped M :overwritten K :file PATH)."
+Returns plist (:added N :skipped M :overwritten K :file PATH
+:warnings LIST)."
   (let* ((abs (anvil--prepare-path path))
          (on-dup (or (plist-get opts :on-duplicate) 'skip))
          (explicit-indent (plist-get opts :indent))
          (normalized (anvil--json-normalize-pairs pairs))
          (added 0) (skipped 0) (overwritten 0)
-         (keys-to-insert '()))
+         (keys-to-insert '())
+         warnings)
     (with-temp-buffer
       (anvil--insert-file abs)
       (let* ((content (buffer-string))
@@ -1590,8 +1609,9 @@ Returns plist (:added N :skipped M :overwritten K :file PATH)."
                 (insert "\n")
                 (cl-incf i))))
           (setq added (length keys-to-insert))))
-      (anvil--write-current-buffer-to abs))
-    (list :added added :skipped skipped :overwritten overwritten :file abs)))
+      (setq warnings (anvil--write-current-buffer-to abs)))
+    (list :added added :skipped skipped :overwritten overwritten :file abs
+          :warnings warnings)))
 
 ;;;; --- import line idempotent insert ---------------------------------------
 
@@ -1650,21 +1670,24 @@ Returns plist:
               (unless (bolp) (insert "\n"))
               (insert target-line "\n")
               (let ((ln (1- (line-number-at-pos))))
-                (anvil--write-current-buffer-to abs)
+                (setq warnings
+                      (append warnings (anvil--write-current-buffer-to abs)))
                 (list :inserted t :already-present nil
                       :line ln :file abs :warnings warnings)))
              (insert-line
               (goto-char (point-min))
               (forward-line (1- insert-line))
               (insert target-line "\n")
-              (anvil--write-current-buffer-to abs)
+              (setq warnings
+                    (append warnings (anvil--write-current-buffer-to abs)))
               (list :inserted t :already-present nil
                     :line insert-line :file abs :warnings warnings))
              (t
               ;; No matches: insert at top (line 1)
               (goto-char (point-min))
               (insert target-line "\n")
-              (anvil--write-current-buffer-to abs)
+              (setq warnings
+                    (append warnings (anvil--write-current-buffer-to abs)))
               (list :inserted t :already-present nil
                     :line 1 :file abs :warnings warnings)))))))))
 
@@ -2155,7 +2178,7 @@ in block (file %s, line %d) — pass :on-existing 'skip or 'overwrite"
                  (delete-region (1- from) to)
                  (goto-char (1- from))
                  (insert "\"" (nth 3 e))))))
-          (anvil--write-current-buffer-to abs))
+          (setq warnings (append warnings (anvil--write-current-buffer-to abs))))
         (let ((missing-list nil))
           (maphash (lambda (k v) (push (cons k v) missing-list))
                    missing-counts)

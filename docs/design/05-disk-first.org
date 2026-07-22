@@ -13,6 +13,15 @@
 - ~buffer-list-modified~  — file-visiting な modified buffer 全列挙
 Doc 05 の三部作は完了、残タスクはドキュメント化と長期 soak のみ。
 
+~Write-after-edit resync SHIPPED~ (2026-07-22) — 「Write-after-buffer-edit
+の扱い」節の未実装だった半分を実装。全 file-* 書き込み
+(~anvil--write-current-buffer-to~ / ~anvil-file-safe-write~) の直後に
+~anvil-file-resync-buffer~ が clean な visited buffer を自動 revert
+(narrowing 保持、~preserve-modes~)。modified buffer は保護して警告のみ、
+modtime=0 の intentional stale buffer (init.org 型) は skip。resync の
+警告は各 tool の ~:warnings~ に merge される。
+~anvil-disk-resync-after-write~ (default t) で無効化可。
+
 * Goal
 
 anvil の全 file-* MCP tool において、以下を *契約 (contract)* として確立する:

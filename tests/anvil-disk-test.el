@@ -167,4 +167,74 @@ Avoids flaky 1-second NTFS / 2-second FAT resolution in tests."
     (let ((res (anvil-file-safe-write f "whatever\n")))
       (should (eq 'no-buffer (plist-get res :status))))))
 
+;;;; --- post-write resync ---------------------------------------------------
+
+(ert-deftest anvil-disk-test-resync-reverts-clean-buffer ()
+  "A clean buffer visiting the file is reverted to the disk content."
+  (anvil-disk-test--with-file (f buf) "hello\n"
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region "rewritten\n" nil f nil 'silent))
+    (anvil-disk-test--bump-disk-mtime f)
+    (should (null (anvil-file-resync-buffer f)))
+    (should (equal "rewritten\n" (with-current-buffer buf (buffer-string))))
+    (should (eq 'in-sync
+                (plist-get (anvil-disk-buffer-divergence f) :status)))))
+
+(ert-deftest anvil-disk-test-resync-keeps-modified-buffer ()
+  "Unsaved edits are never discarded; a warning is returned instead."
+  (anvil-disk-test--with-file (f buf) "hello\n"
+    (with-current-buffer buf
+      (goto-char (point-max))
+      (insert "user edit\n"))
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region "rewritten\n" nil f nil 'silent))
+    (anvil-disk-test--bump-disk-mtime f)
+    (let ((ws (anvil-file-resync-buffer f)))
+      (should (= 1 (length ws)))
+      (should (string-match-p "unsaved edits" (car ws))))
+    (should (string-match-p "user edit"
+                            (with-current-buffer buf (buffer-string))))))
+
+(ert-deftest anvil-disk-test-resync-skips-unknown-modtime ()
+  "An intentionally-stale buffer (zero modtime) is left untouched."
+  (anvil-disk-test--with-file (f buf) "hello\n"
+    (with-current-buffer buf
+      (set-visited-file-modtime 0))
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region "rewritten\n" nil f nil 'silent))
+    (should (null (anvil-file-resync-buffer f)))
+    (should (equal "hello\n" (with-current-buffer buf (buffer-string))))))
+
+(ert-deftest anvil-disk-test-resync-preserves-narrowing ()
+  "Narrowing survives the revert."
+  (anvil-disk-test--with-file (f buf) "one\ntwo\nthree\n"
+    (with-current-buffer buf
+      (narrow-to-region 5 9))          ; the "two\n" line
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region "one\ntwo\nfour\n" nil f nil 'silent))
+    (anvil-disk-test--bump-disk-mtime f)
+    (should (null (anvil-file-resync-buffer f)))
+    (with-current-buffer buf
+      (should (buffer-narrowed-p))
+      (should (equal "one\ntwo\nfour\n"
+                     (save-restriction (widen) (buffer-string)))))))
+
+(ert-deftest anvil-disk-test-resync-disabled-by-defcustom ()
+  "With `anvil-disk-resync-after-write' nil the buffer stays stale."
+  (anvil-disk-test--with-file (f buf) "hello\n"
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region "rewritten\n" nil f nil 'silent))
+    (anvil-disk-test--bump-disk-mtime f)
+    (let ((anvil-disk-resync-after-write nil))
+      (should (null (anvil-file-resync-buffer f))))
+    (should (equal "hello\n" (with-current-buffer buf (buffer-string))))))
+
+(ert-deftest anvil-disk-test-safe-write-resyncs-clean-buffer ()
+  "safe-write leaves a clean visiting buffer matching the new disk content."
+  (anvil-disk-test--with-file (f buf) "hello\n"
+    (let ((res (anvil-file-safe-write f "new content\n")))
+      (should (null (plist-get res :warnings))))
+    (should (equal "new content\n" (with-current-buffer buf (buffer-string))))
+    (should-not (buffer-modified-p buf))))
+
 ;;; anvil-disk-test.el ends here

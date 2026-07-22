@@ -20,6 +20,9 @@
 ;;   - `anvil-file-require-in-sync'   — signal when not in-sync.
 ;;   - `anvil-file-safe-write'        — write to disk but refuse when
 ;;     a visited buffer has unsaved edits, unless :force is passed.
+;;   - `anvil-file-resync-buffer'     — after a disk write, revert a
+;;     clean visiting buffer so it matches disk (the write-after-edit
+;;     half of the doc 05 design).
 ;;
 ;; No MCP tool is registered here; the helpers are the shared
 ;; primitive that Phase 2 (file-* tool audit) and Phase 3 (buffer-*
@@ -118,6 +121,87 @@ to be embedded into tool response plists under `:warnings'."
       (user-error "anvil-file-require-in-sync: %s (status %s)"
                   file status))))
 
+;;;; --- post-write resync ---------------------------------------------------
+
+(defcustom anvil-disk-resync-after-write t
+  "When non-nil, disk-side writes revert a clean visiting buffer.
+Implements the write-after-edit policy of the disk-first design
+(docs/design/05-disk-first.org): after a mutating `file-*' tool
+writes a file that is open in an unmodified buffer, the buffer is
+reverted so it matches disk again — no stale buffer, no
+supersession prompt, no manual revert needed between successive
+edits.  Buffers with unsaved edits and intentionally-stale
+buffers (zero `visited-file-modtime') are never touched.  Set to
+nil to restore the previous warn-only behavior."
+  :type 'boolean
+  :group 'anvil-disk)
+
+(defun anvil-disk--revert-clean-buffer (buf)
+  "Revert unmodified BUF from disk, preserving narrowing.
+Returns a list of warning strings; empty on clean success.  A
+failed revert is reported as a warning, not signaled — the disk
+write this call follows has already succeeded, and erroring here
+would misreport it as failed."
+  (with-current-buffer buf
+    (let ((was-narrowed (buffer-narrowed-p))
+          (narrow-start nil)
+          (narrow-end nil)
+          (warnings nil))
+      (when was-narrowed
+        (setq narrow-start (point-min-marker))
+        (setq narrow-end (point-max-marker)))
+      (condition-case err
+          (unwind-protect
+              (progn
+                (revert-buffer :ignore-auto :noconfirm :preserve-modes)
+                (when (buffer-modified-p)
+                  (push (format "anvil-disk: buffer %s re-modified during \
+resync; check `after-revert-hook' for functions that modify the buffer"
+                                (buffer-name))
+                        warnings)))
+            ;; Restore narrowing even if revert fails.
+            (when was-narrowed
+              (narrow-to-region narrow-start narrow-end)))
+        (error
+         (push (format "anvil-disk: resync of buffer %s failed: %s \
+(the disk write itself succeeded); check `revert-buffer-function', \
+`before-revert-hook', `after-revert-hook'"
+                       (buffer-name) (error-message-string err))
+               warnings)))
+      (nreverse warnings))))
+
+(defun anvil-file-resync-buffer (file)
+  "Make a clean buffer visiting FILE match the disk content.
+Call immediately after a disk-side write to FILE.  Dispatch on
+the divergence status (see `anvil-disk-buffer-divergence'):
+
+  no buffer       — nothing to do.
+  `unknown'       — intentionally-stale buffer (zero modtime,
+                    init.org type); left untouched, no warning.
+  `buffer-newer' / `both-modified'
+                  — unsaved user edits; never discarded, a
+                    warning is returned instead.
+  `disk-newer' / `in-sync'
+                  — clean buffer; reverted from disk.  `in-sync'
+                    is reverted too because right after a write it
+                    can only mean the mtime landed within the
+                    filesystem's timestamp granularity (doc 05
+                    platform notes) while the content did change.
+
+No-op when `anvil-disk-resync-after-write' is nil.  Returns a
+list of warning strings for anything skipped or failed; empty
+list otherwise."
+  (when anvil-disk-resync-after-write
+    (let* ((div (anvil-disk-buffer-divergence file))
+           (status (and div (plist-get div :status))))
+      (pcase status
+        ((or 'nil 'unknown) nil)
+        ((or 'buffer-newer 'both-modified)
+         (list (format "anvil-disk: buffer %s has unsaved edits; not \
+resynced after disk write (its content no longer matches disk)"
+                       (buffer-name (plist-get div :buffer)))))
+        (_ (anvil-disk--revert-clean-buffer (plist-get div :buffer)))))))
+
 ;;;; --- safe write ----------------------------------------------------------
 
 (cl-defun anvil-file-safe-write (file content &key force)
@@ -133,8 +217,14 @@ buffer has no pending changes (or the modtime is intentionally
 zero), and a disk-authoritative overwrite is the documented policy
 of the disk-first design.
 
+After the write, a clean visiting buffer is reverted to the new
+disk content via `anvil-file-resync-buffer'.
+
 Returns a plist:
-  (:file ABS :status STATUS :forced t-or-nil :bytes-written N)"
+  (:file ABS :status STATUS :forced t-or-nil :bytes-written N
+   :warnings LIST)
+where :warnings carries the post-write resync warnings (empty
+list when nothing was skipped or failed)."
   (let* ((abs (expand-file-name file))
          (div (anvil-disk-buffer-divergence abs))
          (status (and div (plist-get div :status))))
@@ -158,7 +248,8 @@ pass :force t to override"
     (list :file          abs
           :status        (or status 'no-buffer)
           :forced        (and force t)
-          :bytes-written (string-bytes content))))
+          :bytes-written (string-bytes content)
+          :warnings      (anvil-file-resync-buffer abs))))
 
 (provide 'anvil-disk)
 ;;; anvil-disk.el ends here
