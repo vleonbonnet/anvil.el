@@ -374,20 +374,20 @@ MCP Parameters:
                            (float-time
                             (time-subtract (or finish now)
                                            run-start))))))
-            (when (and (not (eq status 'running))
-                       (> elapsed 600))
-              (remhash job-id anvil-eval--async-jobs))
-            (format
-             (concat "status: %s\n"
-                     "elapsed: %.1fs\n"
-                     "age: %.1fs\n"
-                     "queue-wait: %s\n"
-                     "runtime: %s\n"
-                     "result: %s")
-             status elapsed elapsed
-             (anvil-eval--format-seconds queue-wait)
-             (anvil-eval--format-seconds runtime)
-             (or result "N/A"))))))))
+          (when (and (not (eq status 'running))
+                     (> elapsed 600))
+            (remhash job-id anvil-eval--async-jobs))
+          (format
+           (concat "status: %s\n"
+                   "elapsed: %.1fs\n"
+                   "age: %.1fs\n"
+                   "queue-wait: %s\n"
+                   "runtime: %s\n"
+                   "result: %s")
+           status elapsed elapsed
+           (anvil-eval--format-seconds queue-wait)
+           (anvil-eval--format-seconds runtime)
+           (or result "N/A"))))))))
 
 (defun anvil-eval--jobs ()
   "List all async jobs and their statuses.
