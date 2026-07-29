@@ -35,41 +35,41 @@
 (ert-deftest anvil-eval-fast-mode-test-agenda-file-keeps-font-lock ()
   "The fast path is skipped for buffers visiting agenda files."
   (anvil-eval-fast-mode-test--with-org-file file
-    (let ((anvil-eval-org-fast-mode t)
-          (anvil-eval--in-org-fast-mode t)
-          (org-agenda-files (list file)))
-      (with-current-buffer (find-file-noselect file)
-        ;; find-file-noselect already ran org-mode through the advice;
-        ;; re-run explicitly to pin the decision under fast-mode flags.
-        (anvil-eval--org-mode-fast-advice #'org-mode)
-        (should-not delay-mode-hooks)
-        (should-not (and (boundp 'font-lock-mode-set-explicitly)
-                         font-lock-mode-set-explicitly))))))
+                                            (let ((anvil-eval-org-fast-mode t)
+                                                  (anvil-eval--in-org-fast-mode t)
+                                                  (org-agenda-files (list file)))
+                                              (with-current-buffer (find-file-noselect file)
+                                                ;; find-file-noselect already ran org-mode through the advice;
+                                                ;; re-run explicitly to pin the decision under fast-mode flags.
+                                                (anvil-eval--org-mode-fast-advice #'org-mode)
+                                                (should-not delay-mode-hooks)
+                                                (should-not (and (boundp 'font-lock-mode-set-explicitly)
+                                                                 font-lock-mode-set-explicitly))))))
 
 (ert-deftest anvil-eval-fast-mode-test-other-files-stay-fast ()
   "Non-agenda buffers still get the minimal fast-path setup."
   (anvil-eval-fast-mode-test--with-org-file file
-    (let ((anvil-eval-org-fast-mode t)
-          (anvil-eval--in-org-fast-mode t)
-          (org-agenda-files nil))
-      (with-current-buffer (find-file-noselect file)
-        (anvil-eval--org-mode-fast-advice #'org-mode)
-        (should delay-mode-hooks)
-        (when (boundp 'org-element-use-cache)
-          (should-not org-element-use-cache))))))
+                                            (let ((anvil-eval-org-fast-mode t)
+                                                  (anvil-eval--in-org-fast-mode t)
+                                                  (org-agenda-files nil))
+                                              (with-current-buffer (find-file-noselect file)
+                                                (anvil-eval--org-mode-fast-advice #'org-mode)
+                                                (should delay-mode-hooks)
+                                                (when (boundp 'org-element-use-cache)
+                                                  (should-not org-element-use-cache))))))
 
 (ert-deftest anvil-eval-fast-mode-test-agenda-check-does-not-visit-files ()
   "Checking agenda membership does not visit other agenda files."
   (anvil-eval-fast-mode-test--with-org-file file
-    (anvil-eval-fast-mode-test--with-org-file other-file
-      (let ((anvil-eval-org-fast-mode t)
-            (anvil-eval--in-org-fast-mode t)
-            (org-agenda-files nil))
-        (let ((buffer (find-file-noselect file)))
-          (let ((org-agenda-files (list file other-file)))
-            (with-current-buffer buffer
-              (anvil-eval--org-mode-fast-advice #'ignore)))
-          (should-not (find-buffer-visiting other-file)))))))
+                                            (anvil-eval-fast-mode-test--with-org-file other-file
+                                                                                      (let ((anvil-eval-org-fast-mode t)
+                                                                                            (anvil-eval--in-org-fast-mode t)
+                                                                                            (org-agenda-files nil))
+                                                                                        (let ((buffer (find-file-noselect file)))
+                                                                                          (let ((org-agenda-files (list file other-file)))
+                                                                                            (with-current-buffer buffer
+                                                                                              (anvil-eval--org-mode-fast-advice #'ignore)))
+                                                                                          (should-not (find-buffer-visiting other-file)))))))
 
 (provide 'anvil-eval-fast-mode-test)
 ;;; anvil-eval-fast-mode-test.el ends here

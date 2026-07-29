@@ -273,68 +273,68 @@ MCP Parameters:
                Use for long-running operations that would timeout with
                emacs-eval."
   (anvil-server-with-error-handling
-    (let* ((job-id (format "job-%d-%d"
-                           (setq anvil-eval--async-counter
-                                 (1+ anvil-eval--async-counter))
-                           (truncate (float-time))))
-           (form (car (read-from-string expression))))
-      (puthash job-id
-               (list :status 'running
-                     :result nil
-                     :expression expression
-                     :start-time (current-time))
-               anvil-eval--async-jobs)
-      (run-with-timer 0 nil
-        (lambda ()
-          (let ((job (gethash job-id anvil-eval--async-jobs)))
-            (when job
-              (let ((run-start (current-time))
-                    status result)
-                (setq job (plist-put job :run-start-time run-start))
-                (unwind-protect
-                    ;; `timer-event-handler' binds `inhibit-quit' to t, so
-                    ;; without this rebinding a long-running form freezes
-                    ;; Emacs with C-g dead until the form completes.
-                    (let ((inhibit-quit nil))
-                      (condition-case err
-                          (setq result (format "%S" (eval form t))
-                                status 'done)
-                        (quit
-                         (setq result "Interrupted by C-g"
-                               status 'error))
-                        (error
-                         (setq result (format "Error: %S" err)
-                               status 'error))))
-                  ;; Exits that bypass both handlers (throw to `top-level'
-                  ;; from the debugger, `abort-recursive-edit') still run
-                  ;; this cleanup mid-unwind, so the whole settling step
-                  ;; lives here — after such a throw nothing below the
-                  ;; unwind-protect would run.  Unsettled jobs otherwise
-                  ;; show `running' with climbing runtime forever.
-                  ;; `inhibit-quit' is t again (timer binding), so the
-                  ;; bookkeeping itself cannot be interrupted.
-                  (unless status
-                    (setq status 'error
-                          result "Aborted: non-local exit during evaluation"))
-                  (let ((finish (current-time)))
-                    (setq job (plist-put job :status status))
-                    (setq job (plist-put job :result result))
-                    (setq job (plist-put job :finish-time finish))
-                    (setq
-                     job
-                     (plist-put
-                      job :queue-wait-sec
-                      (float-time
-                       (time-subtract run-start
-                                      (plist-get job :start-time)))))
-                    (setq
-                     job
-                     (plist-put
-                      job :runtime-sec
-                      (float-time
-                       (time-subtract finish run-start))))
-                    (puthash job-id job anvil-eval--async-jobs))))))))
-      (format "Job started: %s" job-id))))
+   (let* ((job-id (format "job-%d-%d"
+                          (setq anvil-eval--async-counter
+                                (1+ anvil-eval--async-counter))
+                          (truncate (float-time))))
+          (form (car (read-from-string expression))))
+     (puthash job-id
+              (list :status 'running
+                    :result nil
+                    :expression expression
+                    :start-time (current-time))
+              anvil-eval--async-jobs)
+     (run-with-timer 0 nil
+                     (lambda ()
+                       (let ((job (gethash job-id anvil-eval--async-jobs)))
+                         (when job
+                           (let ((run-start (current-time))
+                                 status result)
+                             (setq job (plist-put job :run-start-time run-start))
+                             (unwind-protect
+                                 ;; `timer-event-handler' binds `inhibit-quit' to t, so
+                                 ;; without this rebinding a long-running form freezes
+                                 ;; Emacs with C-g dead until the form completes.
+                                 (let ((inhibit-quit nil))
+                                   (condition-case err
+                                       (setq result (format "%S" (eval form t))
+                                             status 'done)
+                                     (quit
+                                      (setq result "Interrupted by C-g"
+                                            status 'error))
+                                     (error
+                                      (setq result (format "Error: %S" err)
+                                            status 'error))))
+                               ;; Exits that bypass both handlers (throw to `top-level'
+                               ;; from the debugger, `abort-recursive-edit') still run
+                               ;; this cleanup mid-unwind, so the whole settling step
+                               ;; lives here — after such a throw nothing below the
+                               ;; unwind-protect would run.  Unsettled jobs otherwise
+                               ;; show `running' with climbing runtime forever.
+                               ;; `inhibit-quit' is t again (timer binding), so the
+                               ;; bookkeeping itself cannot be interrupted.
+                               (unless status
+                                 (setq status 'error
+                                       result "Aborted: non-local exit during evaluation"))
+                               (let ((finish (current-time)))
+                                 (setq job (plist-put job :status status))
+                                 (setq job (plist-put job :result result))
+                                 (setq job (plist-put job :finish-time finish))
+                                 (setq
+                                  job
+                                  (plist-put
+                                   job :queue-wait-sec
+                                   (float-time
+                                    (time-subtract run-start
+                                                   (plist-get job :start-time)))))
+                                 (setq
+                                  job
+                                  (plist-put
+                                   job :runtime-sec
+                                   (float-time
+                                    (time-subtract finish run-start))))
+                                 (puthash job-id job anvil-eval--async-jobs))))))))
+     (format "Job started: %s" job-id))))
 
 (defun anvil-eval--format-seconds (seconds)
   "Format SECONDS as a compact duration string, or return \"N/A\"."
@@ -351,65 +351,65 @@ MCP Parameters:
   job-id - The job ID returned by emacs-eval-async (string, required)
            Example: \"job-1-1711843200\""
   (anvil-server-with-error-handling
-    (let ((job (gethash job-id anvil-eval--async-jobs)))
-      (if (not job)
-          (format "Job not found: %s (may have been cleaned up)" job-id)
-        (let ((status (plist-get job :status))
-              (result (plist-get job :result))
-              (now (current-time)))
-          (let* ((start-time (plist-get job :start-time))
-                 (run-start (plist-get job :run-start-time))
-                 (finish (plist-get job :finish-time))
-                 (elapsed (float-time
-                           (time-subtract now start-time)))
-                 (queue-wait
-                  (or (plist-get job :queue-wait-sec)
-                      (and run-start
-                           (float-time
-                            (time-subtract run-start start-time)))
-                      elapsed))
-                 (runtime
-                  (or (plist-get job :runtime-sec)
-                      (and run-start
-                           (float-time
-                            (time-subtract (or finish now)
-                                           run-start))))))
-          (when (and (not (eq status 'running))
-                     (> elapsed 600))
-            (remhash job-id anvil-eval--async-jobs))
-          (format
-           (concat "status: %s\n"
-                   "elapsed: %.1fs\n"
-                   "age: %.1fs\n"
-                   "queue-wait: %s\n"
-                   "runtime: %s\n"
-                   "result: %s")
-           status elapsed elapsed
-           (anvil-eval--format-seconds queue-wait)
-           (anvil-eval--format-seconds runtime)
-           (or result "N/A"))))))))
+   (let ((job (gethash job-id anvil-eval--async-jobs)))
+     (if (not job)
+         (format "Job not found: %s (may have been cleaned up)" job-id)
+       (let ((status (plist-get job :status))
+             (result (plist-get job :result))
+             (now (current-time)))
+         (let* ((start-time (plist-get job :start-time))
+                (run-start (plist-get job :run-start-time))
+                (finish (plist-get job :finish-time))
+                (elapsed (float-time
+                          (time-subtract now start-time)))
+                (queue-wait
+                 (or (plist-get job :queue-wait-sec)
+                     (and run-start
+                          (float-time
+                           (time-subtract run-start start-time)))
+                     elapsed))
+                (runtime
+                 (or (plist-get job :runtime-sec)
+                     (and run-start
+                          (float-time
+                           (time-subtract (or finish now)
+                                          run-start))))))
+           (when (and (not (eq status 'running))
+                      (> elapsed 600))
+             (remhash job-id anvil-eval--async-jobs))
+           (format
+            (concat "status: %s\n"
+                    "elapsed: %.1fs\n"
+                    "age: %.1fs\n"
+                    "queue-wait: %s\n"
+                    "runtime: %s\n"
+                    "result: %s")
+            status elapsed elapsed
+            (anvil-eval--format-seconds queue-wait)
+            (anvil-eval--format-seconds runtime)
+            (or result "N/A"))))))))
 
 (defun anvil-eval--jobs ()
   "List all async jobs and their statuses.
 
 MCP Parameters: (none)"
   (anvil-server-with-error-handling
-    (let ((jobs '()))
-      (maphash
-       (lambda (id job)
-         (push (format "%s: %s (%.1fs) - %s"
-                       id
-                       (plist-get job :status)
-                       (float-time
-                        (time-subtract (current-time)
-                                       (plist-get job :start-time)))
-                       (truncate-string-to-width
-                        (or (plist-get job :expression) "") 50))
-               jobs))
-       anvil-eval--async-jobs)
-      (if jobs
-          (mapconcat #'identity (nreverse jobs) "\n")
-        "No async jobs."))))
+   (let ((jobs '()))
+     (maphash
+      (lambda (id job)
+        (push (format "%s: %s (%.1fs) - %s"
+                      id
+                      (plist-get job :status)
+                      (float-time
+                       (time-subtract (current-time)
+                                      (plist-get job :start-time)))
+                      (truncate-string-to-width
+                       (or (plist-get job :expression) "") 50))
+              jobs))
+      anvil-eval--async-jobs)
+     (if jobs
+         (mapconcat #'identity (nreverse jobs) "\n")
+       "No async jobs."))))
 
 ;;; Module enable/disable
 
