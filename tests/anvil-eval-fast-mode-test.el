@@ -58,5 +58,18 @@
         (when (boundp 'org-element-use-cache)
           (should-not org-element-use-cache))))))
 
+(ert-deftest anvil-eval-fast-mode-test-agenda-check-does-not-visit-files ()
+  "Checking agenda membership does not visit other agenda files."
+  (anvil-eval-fast-mode-test--with-org-file file
+    (anvil-eval-fast-mode-test--with-org-file other-file
+      (let ((anvil-eval-org-fast-mode t)
+            (anvil-eval--in-org-fast-mode t)
+            (org-agenda-files nil))
+        (let ((buffer (find-file-noselect file)))
+          (let ((org-agenda-files (list file other-file)))
+            (with-current-buffer buffer
+              (anvil-eval--org-mode-fast-advice #'ignore)))
+          (should-not (find-buffer-visiting other-file)))))))
+
 (provide 'anvil-eval-fast-mode-test)
 ;;; anvil-eval-fast-mode-test.el ends here
