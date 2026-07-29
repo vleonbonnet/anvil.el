@@ -291,30 +291,49 @@ MCP Parameters:
               (let ((run-start (current-time))
                     status result)
                 (setq job (plist-put job :run-start-time run-start))
-                (condition-case err
-                    (setq result (format "%S" (eval form t))
-                          status 'done)
-                  (error
-                   (setq result (format "Error: %S" err)
-                         status 'error)))
-                (let ((finish (current-time)))
-                  (setq job (plist-put job :status status))
-                  (setq job (plist-put job :result result))
-                  (setq job (plist-put job :finish-time finish))
-                  (setq
-                   job
-                   (plist-put
-                    job :queue-wait-sec
-                    (float-time
-                     (time-subtract run-start
-                                    (plist-get job :start-time)))))
-                  (setq
-                   job
-                   (plist-put
-                    job :runtime-sec
-                    (float-time
-                     (time-subtract finish run-start))))
-                  (puthash job-id job anvil-eval--async-jobs)))))))
+                (unwind-protect
+                    ;; `timer-event-handler' binds `inhibit-quit' to t, so
+                    ;; without this rebinding a long-running form freezes
+                    ;; Emacs with C-g dead until the form completes.
+                    (let ((inhibit-quit nil))
+                      (condition-case err
+                          (setq result (format "%S" (eval form t))
+                                status 'done)
+                        (quit
+                         (setq result "Interrupted by C-g"
+                               status 'error))
+                        (error
+                         (setq result (format "Error: %S" err)
+                               status 'error))))
+                  ;; Exits that bypass both handlers (throw to `top-level'
+                  ;; from the debugger, `abort-recursive-edit') still run
+                  ;; this cleanup mid-unwind, so the whole settling step
+                  ;; lives here — after such a throw nothing below the
+                  ;; unwind-protect would run.  Unsettled jobs otherwise
+                  ;; show `running' with climbing runtime forever.
+                  ;; `inhibit-quit' is t again (timer binding), so the
+                  ;; bookkeeping itself cannot be interrupted.
+                  (unless status
+                    (setq status 'error
+                          result "Aborted: non-local exit during evaluation"))
+                  (let ((finish (current-time)))
+                    (setq job (plist-put job :status status))
+                    (setq job (plist-put job :result result))
+                    (setq job (plist-put job :finish-time finish))
+                    (setq
+                     job
+                     (plist-put
+                      job :queue-wait-sec
+                      (float-time
+                       (time-subtract run-start
+                                      (plist-get job :start-time)))))
+                    (setq
+                     job
+                     (plist-put
+                      job :runtime-sec
+                      (float-time
+                       (time-subtract finish run-start))))
+                    (puthash job-id job anvil-eval--async-jobs))))))))
       (format "Job started: %s" job-id))))
 
 (defun anvil-eval--format-seconds (seconds)

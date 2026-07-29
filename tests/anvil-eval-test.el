@@ -108,6 +108,45 @@
         (should (string-match-p "^queue-wait: [0-9.]+s" out))
         (should (string-match-p "^runtime: [0-9.]+s" out))))))
 
+(defun anvil-eval-test--await-job (job-id &optional timeout)
+  "Pump the event loop until JOB-ID settles or TIMEOUT seconds pass."
+  (let ((deadline (+ (float-time) (or timeout 1.0))))
+    (while (and (< (float-time) deadline)
+                (eq 'running
+                    (plist-get (gethash job-id anvil-eval--async-jobs)
+                               :status)))
+      (accept-process-output nil 0.01))))
+
+(ert-deftest anvil-eval-test-async-settles-job-on-quit ()
+  "A form that signals `quit' settles the job instead of leaving a
+zombie stuck at status `running' with climbing runtime."
+  (let ((anvil-eval--async-jobs (make-hash-table :test 'equal))
+        (anvil-eval--async-counter 0))
+    (let* ((started (anvil-eval--async "(signal 'quit nil)"))
+           (job-id (replace-regexp-in-string "\\`Job started: " "" started)))
+      (anvil-eval-test--await-job job-id)
+      (let ((job (gethash job-id anvil-eval--async-jobs)))
+        (should (eq 'error (plist-get job :status)))
+        (should (equal "Interrupted by C-g" (plist-get job :result)))
+        (should (numberp (plist-get job :runtime-sec)))))))
+
+(ert-deftest anvil-eval-test-async-settles-job-on-outer-throw ()
+  "A throw that unwinds past the job's handlers (the debugger's
+`top-level', `abort-recursive-edit') still settles the job via the
+unwind-protect cleanup.  The catch sits in this test's stack frame,
+outside the timer, so the throw escapes the job lambda entirely."
+  (let ((anvil-eval--async-jobs (make-hash-table :test 'equal))
+        (anvil-eval--async-counter 0))
+    (let* ((started (anvil-eval--async "(throw 'anvil-eval-test-escape 42)"))
+           (job-id (replace-regexp-in-string "\\`Job started: " "" started)))
+      (catch 'anvil-eval-test-escape
+        (anvil-eval-test--await-job job-id))
+      (let ((job (gethash job-id anvil-eval--async-jobs)))
+        (should (eq 'error (plist-get job :status)))
+        (should (equal "Aborted: non-local exit during evaluation"
+                       (plist-get job :result)))
+        (should (numberp (plist-get job :runtime-sec)))))))
+
 
 ;;;; --- guards -------------------------------------------------------------
 
