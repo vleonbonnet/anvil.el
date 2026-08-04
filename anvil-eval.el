@@ -418,14 +418,6 @@ MCP Parameters: (none)"
 
 (declare-function server-quote-arg "server")
 
-(defvar anvil-eval--server-execute-dontkill-index 5
-  "Index of the `dontkill' argument within `server-execute's arglist.
-Computed from the live arglist by `anvil-eval-enable' because the
-signature has changed across Emacs versions and builds (e.g. stock
-Emacs has it at 4, this emacs-mac build at 5).  Used by
-`anvil-eval--server-execute-cleanup-advice' to identify the client
-class without hardcoding a position.")
-
 (defun anvil-eval--server-execute-cleanup-advice (orig-fn &rest args)
   "Guarantee emacsclient teardown when `server-execute' exits abnormally.
 Without this, a non-local exit during the eval body — e.g.
@@ -449,10 +441,15 @@ genuine abnormal unwind, if this looks like a wait-for-reply client
 `-error' reply and tear the connection down so emacsclient can exit
 cleanly.  When `dontkill' is non-nil — `-window-system' / `-tty' /
 `-resume' / `-suspend' clients — we leave it alone, matching
-upstream `server-execute' behaviour."
-  (let ((proc (nth 0 args))
-        (dontkill (nth anvil-eval--server-execute-dontkill-index args))
-        (completed nil))
+upstream `server-execute' behaviour.
+
+`dontkill' sits at a different ARGS index depending on the Emacs
+version: Emacs 30 inserted `evalexprs' ahead of it (Bug#65902,
+commit 683efb8de5), shifting `dontkill' from index 4 to index 5."
+  (let* ((proc (nth 0 args))
+         (dontkill-index (if (>= emacs-major-version 30) 5 4))
+         (dontkill (nth dontkill-index args))
+         (completed nil))
     (unwind-protect
         (prog1 (apply orig-fn args)
           (setq completed t))
@@ -482,10 +479,6 @@ upstream `server-execute' behaviour."
   (advice-add 'org-mode :around #'anvil-eval--org-mode-fast-advice)
   (advice-add 'anvil-server-process-jsonrpc
               :around #'anvil-eval--request-mutex-advice)
-  (setq anvil-eval--server-execute-dontkill-index
-        (or (cl-position 'dontkill
-                         (help-function-arglist 'server-execute t))
-            anvil-eval--server-execute-dontkill-index))
   (advice-add 'server-execute
               :around #'anvil-eval--server-execute-cleanup-advice)
   ;; Register tools

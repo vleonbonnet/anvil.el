@@ -57,11 +57,7 @@
 (ert-deftest anvil-eval-server-execute-test-dontkill-left-alone ()
   "Abnormal unwind of a dontkill client leaves the connection alone."
   (anvil-eval-server-execute-test--with-open-process proc
-    (let ((sent nil) (deleted nil)
-          ;; `dontkill' sits at index 5 in this build's `server-execute'
-          ;; signature (proc files nowait commands evalexprs dontkill
-          ;; frame tty-name); pin the advice to read it there.
-          (anvil-eval--server-execute-dontkill-index 5))
+    (let ((sent nil) (deleted nil))
       (cl-letf (((symbol-function 'process-send-string)
                  (lambda (_p s) (setq sent s)))
                 ((symbol-function 'delete-process)
@@ -93,10 +89,9 @@ a frameless `emacsclient FILE' client returns from `server-execute'
 normally yet keeps its connection open so the user can edit.  The
 COMPLETED sentinel must suppress teardown — without it the bare
 `unwind-protect' cleanup fired on this normal return and killed the
-editor the instant it connected."
+  editor the instant it connected."
   (anvil-eval-server-execute-test--with-open-process proc
-    (let ((sent nil) (deleted nil)
-          (anvil-eval--server-execute-dontkill-index 5))
+    (let ((sent nil) (deleted nil))
       (cl-letf (((symbol-function 'process-send-string)
                  (lambda (_p s) (setq sent s)))
                 ((symbol-function 'delete-process)
