@@ -4,8 +4,10 @@
 # Usage (from ~/.claude/settings.json):
 #   PostToolUse / UserPromptSubmit:
 #     .../scripts/anvil-capture-hook
+#   SessionEnd:
+#     .../scripts/anvil-capture-hook --prune
 #
-# Takes NO arguments.  Claude Code delivers the whole hook payload
+# Takes no arguments in capture mode.  Claude Code delivers the payload
 # on stdin as JSON — session_id, cwd, tool_name, tool_input,
 # tool_response — and that payload is the point of this script.
 #
@@ -36,6 +38,15 @@ set -u
 
 emacsclient="${ANVIL_EMACSCLIENT:-emacsclient}"
 socket="${ANVIL_CAPTURE_SOCKET:-server}"
+
+# --prune: drop rows past the TTL. Wired to SessionEnd, where stdin
+# carries no tool payload worth classifying.
+if [ "${1:-}" = "--prune" ]; then
+	"$emacsclient" -s "$socket" -e \
+		'(progn (require (quote anvil-session-store)) (anvil-session-store-prune))' \
+		>/dev/null 2>&1
+	exit 0
+fi
 
 tmp=$(mktemp "${TMPDIR:-/tmp}/anvil-capture.XXXXXX" 2>/dev/null) || exit 0
 # shellcheck disable=SC2064

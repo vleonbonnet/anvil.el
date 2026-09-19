@@ -1,13 +1,14 @@
 #+title: anvil-session-store — Indexed Session Continuity
 #+date: 2026-09-19
 #+author: zawatton
-#+property: status PHASE-1-2-SHIPPED
+#+property: status PHASE-1-2-3-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
 
-~PHASE-1-2-SHIPPED~ (2026-09-19).  Phase 3 (hook wiring + PreCompact
-handover) is designed below but not installed.
+~PHASE-1-2-3-SHIPPED~ (2026-09-19).  Phase 3's PreCompact handover is
+in; its settings.json wiring is documented as a manual step, for the
+reasons under Phase 3.
 
 Successor to Doc 17 Phase 3, which shipped the hook lifecycle but
 settled for a linear scan where its own design called for FTS5.
@@ -148,22 +149,52 @@ are worth stating because they are judgement calls, not mechanics:
   state-changing subcommands earn a P1 =git= row.  Otherwise the
   commits drown in status calls.
 
-* Phase 3 — hook wiring + PreCompact handover (designed, not installed)
+* Phase 3 — PreCompact handover (~SHIPPED~) + wiring (manual)
 
-Two settings.json edits and one dispatch change:
+** PreCompact handover (shipped)
 
-1. Add =scripts/anvil-capture-hook= as a *second* PostToolUse and
-   UserPromptSubmit entry, alongside the existing =anvil-hook= call.
-   Running both keeps the anvil-state row (which =anvil-compact=
-   still reads) and adds the indexed row.
-2. Have =anvil-compact-on-pre-compact= append
-   =anvil-session-store-snapshot-ref= to the snapshot it already
-   builds.
-3. Prune on SessionEnd via =anvil-session-store-prune=.
+=anvil-compact-snapshot-format= takes an optional SESSION-ID and, when
+=anvil-compact-append-session-ref= is non-nil, appends the reference
+snapshot after the existing digest.  The old one-argument call is
+unchanged, so every existing caller and the 56 shipped anvil-compact
+tests keep passing.
 
-Not installed yet because it edits the user's live
-=~/.claude/settings.json=, which Doc 17 Phase 4 deliberately made an
-explicit opt-in (=anvil-session-hooks-enabled=, default nil).
+The defcustom defaults to nil, inheriting Doc 17 Phase 4's opt-in
+stance.  =anvil-compact--session-ref= returns nil rather than
+signalling when the feature is off, the store module is absent, the
+runtime has no SQLite, or the store throws.  That path runs straight
+after =/compact= has wiped the model's history, so an error there
+costs the whole session's continuity — degrading to the plain
+preamble is always the better failure.
+
+** Wiring (manual, by design)
+
+=SessionEnd= gains =anvil-capture-hook --prune=; =PostToolUse= and
+=UserPromptSubmit= gain the capture hook as an *additional* entry
+beside the existing =anvil-hook= call:
+
+#+begin_src json
+{ "type": "command",
+  "command": "/path/to/anvil.el/scripts/anvil-capture-hook" }
+#+end_src
+
+*** Why this is not automated
+
+=anvil-hook-install-settings= cannot be extended to do it.  Its
+planner calls =(puthash claude-key desired new)= — it *replaces* the
+whole value for each hook key rather than appending to the array.  On
+the author's own machine =Stop= currently holds two entries, anvil's
+and an unrelated Discord notifier; running the installer today would
+silently drop the second.  Teaching it to append is a separate change
+to a shipped code path with its own blast radius, and bundling it
+here would hide a destructive fix inside a feature commit.
+
+A second reason is narrower: until this branch merges, the script
+lives at a worktree path.  Wiring the live settings.json to a path
+that disappears when the worktree is removed trades a missing feature
+for a broken hook.
+
+* Dual-target
 
 * Dual-target
 
@@ -173,14 +204,35 @@ Every database call goes through the plain =sqlite-*= surface.
 with no =fboundp= branch — the same arrangement =anvil-semantic.el=
 already relies on.  No Rust was added.
 
+*Measured on 2026-09-19.*  The pure ranking functions were run on the
+standalone runtime and return results identical to Emacs (min-span,
+positions, term splitting, priority lookup).  The SQL path was *not*
+verified there, and the reason is worth recording because it is not an
+anvil defect:
+
+1. The default static build has =nl-ffi-call= =fboundp= but raising
+   =nelisp-unsupported-primitive= — dynamic FFI is opt-in via
+   =NELISP_READER_DYNAMIC=1=.
+2. On a build with FFI actually working (control: =(nl-ffi-call
+   "toupper" 97)= → 65), =nl_sqlite_open= still returned nil even
+   though the symbol is exported by the runtime library, because
+   =nl-ffi-call= resolves against a build-time fixed extern table
+   rather than dlopen'ing an arbitrary path.
+
+So the store reaches =anvil-session-store-available-p= → nil on
+NeLisp today and refuses with a clear error instead of crashing.
+Exercising the SQL path there needs a NeLisp build whose extern table
+carries the =nl_sqlite_*= arm — a NeLisp build-configuration matter.
+
 Per Doc "module categorization": this is *(a) portable 機能系* —
 pure data and SQL, no Emacs-specific workaround — so dual-target is
 required rather than optional.
 
 * Verification
 
-21 ERT tests (11 store + 10 capture), all passing, byte-compiled
-with =byte-compile-error-on-warn=.
+27 new ERT tests (11 store + 10 capture + 6 compact wiring), plus the
+56 shipped anvil-compact tests still green after the signature change.
+All byte-compiled with =byte-compile-error-on-warn=.
 
 The tests were mutation-checked: each mechanism was disabled in turn
 and the test that claims to cover it had to go red.  Two did not,
