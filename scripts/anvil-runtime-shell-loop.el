@@ -28,10 +28,17 @@
 ;;   NELISP_EMACS_DIR — directory containing this file's siblings
 ;;                      `src/emacs-init.el' / `src/emacs-stub.el'
 ;;                      (= the nelisp-emacs checkout root).
+;;   ANVIL_RUNTIME_DAEMON_DIR — state dir for the fast-handshake cache
+;;                      and anvil-server's schema cache (bootstrap
+;;                      `anvil-runtime-bootstrap-state-dir' wins).
 ;;
-;; Once tested end-to-end, the Rust crate `anvil-runtime/' can be
-;; deleted in Final B Stage 2 along with the bin/anvil-runtime symlink
-;; rewire.
+;; The Rust crate `anvil-runtime/' was deleted in Final B Stage 2
+;; (2026-05-10); since NeLisp v1.2.0 (2026-09-04) the reader this file
+;; runs under is the pure-elisp standalone binary (`target/nelisp' /
+;; `target/nelisp.exe', started as `nelisp --load BOOTSTRAP' by
+;; bin/anvil-runtime).  Everything below keeps working on both the
+;; legacy and the v1.2.0 reader: overrides that the newer prelude made
+;; redundant are gated on a functional probe rather than removed.
 
 ;;; Code:
 
@@ -44,9 +51,87 @@
 diagnostic trace lines via `nelisp--write-stderr-line'.  Default
 nil for production (silent).")
 
+;; NeLisp v1.2.0: the pure-elisp standalone reader does not `(provide
+;; 'nelisp)' the way the retired Rust bootstrap did, yet anvil's runtime
+;; detection (`anvil-config-active-p', README "NeLisp standalone" config
+;; path) is contractually `(featurep 'nelisp)'.  Restore the marker here,
+;; gated on the stdin primitive only the standalone reader ships, so host
+;; Emacs loading this file for tests stays untouched.
+(when (and (fboundp 'read-stdin-bytes) (not (featurep 'nelisp)))
+  (provide 'nelisp))
+
 (defun anvil-runtime-shell--env (name default)
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
+
+(defvar anvil-runtime-shell--fast-handshake-enabled
+  (or (and (boundp 'anvil-runtime-bootstrap-fast-handshake-enabled)
+           anvil-runtime-bootstrap-fast-handshake-enabled)
+      (equal (anvil-runtime-shell--env
+              "ANVIL_RUNTIME_FAST_HANDSHAKE" nil)
+             "1"))
+  "When non-nil, serve the pre-load MCP fast handshake.
+The default is nil; set ANVIL_RUNTIME_FAST_HANDSHAKE=1 to opt in.")
+
+(defvar anvil-runtime-shell--primitive-load nil
+  "Standalone `load' function saved before stdlib-misc replaces it.")
+
+(defvar anvil-runtime-shell--primitive-hash-functions nil
+  "Standalone hash functions saved before stdlib-misc replaces them.")
+
+(defvar anvil-runtime-shell--skip-load-files nil
+  "Absolute source files intentionally skipped by the runtime loader.")
+
+(defun anvil-runtime-shell--absolute-file-name-p (file)
+  "Return non-nil when FILE is an absolute name on this platform.
+`file-name-absolute-p' is missing from some standalone images, and a
+leading-slash test alone rejects the Windows reader's own paths: the
+launcher hands the bootstrap `C:/...' names, so every absolute load fell
+through to `locate-library' and failed (measured 2026-09-04, the daemon
+died on emacs-init.el)."
+  (and (stringp file)
+       (> (length file) 0)
+       (if (fboundp 'file-name-absolute-p)
+           (file-name-absolute-p file)
+         (or (eq (aref file 0) ?/)
+             (eq (aref file 0) 92)
+             (and (> (length file) 2)
+                  (eq (aref file 1) ?:)
+                  (or (eq (aref file 2) ?/) (eq (aref file 2) 92)))))))
+
+(defun anvil-runtime-shell--compat-load
+    (file &optional noerror nomessage _nosuffix _must-suffix)
+  "Load FILE with Emacs load context and the standalone native reader."
+  (let ((resolved
+         (if (anvil-runtime-shell--absolute-file-name-p file)
+             (cond
+              ((file-exists-p file) file)
+              ((file-exists-p (concat file ".el")) (concat file ".el"))
+              (t nil))
+           (locate-library file))))
+    (if (null resolved)
+        (if noerror nil
+          (signal 'file-error (list "Cannot open load file" file)))
+      (if (member resolved anvil-runtime-shell--skip-load-files)
+          t
+        (let ((prior-lfn (and (boundp 'load-file-name) load-file-name))
+              (prior-dd (and (boundp 'default-directory) default-directory))
+              (value nil)
+              (err nil))
+          (setq load-file-name resolved)
+          (setq default-directory (file-name-directory resolved))
+          (condition-case caught
+              (setq value
+                    (funcall anvil-runtime-shell--primitive-load
+                             resolved noerror nomessage))
+            (error (setq err caught)))
+          (when (fboundp 'garbage-collect)
+            (garbage-collect))
+          (setq load-file-name prior-lfn)
+          (setq default-directory prior-dd)
+          (cond
+           ((null err) value)
+           (t (signal (car err) (cdr err)))))))))
 
 (defvar anvil-runtime-shell--fast-stdin-buffer ""
   "Unread stdin bytes captured by the fast MCP handshake path.")
@@ -57,11 +142,248 @@ nil for production (silent).")
 (defvar anvil-runtime-shell--fast-trace nil
   "When non-nil, trace the pre-init fast MCP handshake path.")
 
+(defvar anvil-runtime-shell--fast-tools-modules nil
+  "Module list the fast-tools file was written for.
+Set by loading the file; compared against the current
+`ANVIL_TOOL_MODULES' so a cache written for a smaller module set is
+never served as the tools/list of a larger one (measured 2026-09-04: a
+default-module run rewrote the file to 6 tools, and the next six-module
+run advertised those 6 through the fast handshake).")
+
+(defconst anvil-runtime-shell--default-modules
+  "anvil-discovery,anvil-sqlite,anvil-bench"
+  "Tool modules loaded when `ANVIL_TOOL_MODULES' is unset.
+The DB-backed set (`anvil-state,anvil-memory,anvil-worklog') is opt-in
+until a start with it has been measured on the deployment host; see
+CHANGELOG.")
+
 (defun anvil-runtime-shell--fast-log (s)
   "Write fast handshake trace S to stderr when tracing is enabled."
   (when (and anvil-runtime-shell--fast-trace
              (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line s)))
+
+(defun anvil-runtime-shell--fast-warn (s)
+  "Write fast-cache warning S to stderr."
+  (when (fboundp 'nelisp--write-stderr-line)
+    (nelisp--write-stderr-line (concat "[FAST] " s))))
+
+(defun anvil-runtime-shell--fast-json-space-p (c)
+  "Return non-nil when C is JSON whitespace."
+  (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r)))
+
+(defun anvil-runtime-shell--fast-json-skip-space (s i)
+  "Return the first non-whitespace index in S at or after I."
+  (let ((n (length s)))
+    (while (and (< i n)
+                (anvil-runtime-shell--fast-json-space-p (aref s i)))
+      (setq i (1+ i)))
+    i))
+
+(defun anvil-runtime-shell--fast-json-hex-p (c)
+  "Return non-nil when C is a JSON hexadecimal digit."
+  (or (and (>= c ?0) (<= c ?9))
+      (and (>= c ?a) (<= c ?f))
+      (and (>= c ?A) (<= c ?F))))
+
+(defun anvil-runtime-shell--fast-json-string-end (s start)
+  "Return the index after a JSON string in S at START, or nil."
+  (let ((i (1+ start))
+        (n (length s))
+        (done nil)
+        (valid (and (< start (length s)) (eq (aref s start) ?\"))))
+    (while (and valid (not done) (< i n))
+      (let ((c (aref s i)))
+        (cond
+         ((eq c ?\")
+          (setq i (1+ i))
+          (setq done t))
+         ((< c 32)
+          (setq valid nil))
+         ((eq c ?\\)
+          (setq i (1+ i))
+          (if (>= i n)
+              (setq valid nil)
+            (let ((escaped (aref s i)))
+              (if (eq escaped ?u)
+                  (let ((remaining 4))
+                    (while (and valid (> remaining 0))
+                      (setq i (1+ i))
+                      (if (or (>= i n)
+                              (not (anvil-runtime-shell--fast-json-hex-p
+                                    (aref s i))))
+                          (setq valid nil)
+                        (setq remaining (1- remaining))))
+                    (when valid (setq i (1+ i))))
+                (if (or (eq escaped ?\") (eq escaped ?\\)
+                        (eq escaped ?/) (eq escaped ?b)
+                        (eq escaped ?f) (eq escaped ?n)
+                        (eq escaped ?r) (eq escaped ?t))
+                    (setq i (1+ i))
+                  (setq valid nil))))))
+         (t
+          (setq i (1+ i))))))
+    (and valid done i)))
+
+(defun anvil-runtime-shell--fast-json-number-end (s start)
+  "Return the index after a JSON number in S at START, or nil."
+  (let ((i start)
+        (n (length s))
+        (valid t))
+    (when (and (< i n) (eq (aref s i) ?-))
+      (setq i (1+ i)))
+    (cond
+     ((>= i n) (setq valid nil))
+     ((eq (aref s i) ?0) (setq i (1+ i)))
+     ((and (>= (aref s i) ?1) (<= (aref s i) ?9))
+      (while (and (< i n) (>= (aref s i) ?0) (<= (aref s i) ?9))
+        (setq i (1+ i))))
+     (t (setq valid nil)))
+    (when (and valid (< i n) (eq (aref s i) ?.))
+      (setq i (1+ i))
+      (if (or (>= i n) (< (aref s i) ?0) (> (aref s i) ?9))
+          (setq valid nil)
+        (while (and (< i n) (>= (aref s i) ?0) (<= (aref s i) ?9))
+          (setq i (1+ i)))))
+    (when (and valid (< i n)
+               (or (eq (aref s i) ?e) (eq (aref s i) ?E)))
+      (setq i (1+ i))
+      (when (and (< i n)
+                 (or (eq (aref s i) ?+) (eq (aref s i) ?-)))
+        (setq i (1+ i)))
+      (if (or (>= i n) (< (aref s i) ?0) (> (aref s i) ?9))
+          (setq valid nil)
+        (while (and (< i n) (>= (aref s i) ?0) (<= (aref s i) ?9))
+          (setq i (1+ i)))))
+    (and valid i)))
+
+(defun anvil-runtime-shell--fast-json-literal-end (s start literal)
+  "Return the index after LITERAL in S at START, or nil."
+  (let ((end (+ start (length literal))))
+    (and (<= end (length s))
+         (string= (substring s start end) literal)
+         end)))
+
+(defun anvil-runtime-shell--fast-json-array-end (s start)
+  "Return the index after a JSON array in S at START, or nil."
+  (let* ((n (length s))
+         (i (anvil-runtime-shell--fast-json-skip-space s (1+ start)))
+         (done nil)
+         (valid (and (< start n) (eq (aref s start) ?\[))))
+    (if (and valid (< i n) (eq (aref s i) ?\]))
+        (setq i (1+ i) done t)
+      (while (and valid (not done))
+        (setq i (anvil-runtime-shell--fast-json-value-end s i))
+        (if (not i)
+            (setq valid nil)
+          (setq i (anvil-runtime-shell--fast-json-skip-space s i))
+          (cond
+           ((and (< i n) (eq (aref s i) ?,))
+            (setq i (anvil-runtime-shell--fast-json-skip-space s (1+ i))))
+           ((and (< i n) (eq (aref s i) ?\]))
+            (setq i (1+ i) done t))
+           (t (setq valid nil))))))
+    (and valid done i)))
+
+(defun anvil-runtime-shell--fast-json-object-end (s start)
+  "Return the index after a JSON object in S at START, or nil."
+  (let* ((n (length s))
+         (i (anvil-runtime-shell--fast-json-skip-space s (1+ start)))
+         (done nil)
+         (valid (and (< start n) (eq (aref s start) ?\{))))
+    (if (and valid (< i n) (eq (aref s i) ?\}))
+        (setq i (1+ i) done t)
+      (while (and valid (not done))
+        (setq i (anvil-runtime-shell--fast-json-string-end s i))
+        (if (not i)
+            (setq valid nil)
+          (setq i (anvil-runtime-shell--fast-json-skip-space s i))
+          (if (or (>= i n) (not (eq (aref s i) ?:)))
+              (setq valid nil)
+            (setq i (anvil-runtime-shell--fast-json-skip-space s (1+ i)))
+            (setq i (anvil-runtime-shell--fast-json-value-end s i))
+            (if (not i)
+                (setq valid nil)
+              (setq i (anvil-runtime-shell--fast-json-skip-space s i))
+              (cond
+               ((and (< i n) (eq (aref s i) ?,))
+                (setq i
+                      (anvil-runtime-shell--fast-json-skip-space s (1+ i))))
+               ((and (< i n) (eq (aref s i) ?\}))
+                (setq i (1+ i) done t))
+               (t (setq valid nil))))))))
+    (and valid done i)))
+
+(defun anvil-runtime-shell--fast-json-value-end (s start)
+  "Return the index after one JSON value in S at START, or nil."
+  (let* ((i (anvil-runtime-shell--fast-json-skip-space s start))
+         (n (length s))
+         (c (and (< i n) (aref s i))))
+    (cond
+     ((null c) nil)
+     ((eq c ?\") (anvil-runtime-shell--fast-json-string-end s i))
+     ((eq c ?\{) (anvil-runtime-shell--fast-json-object-end s i))
+     ((eq c ?\[) (anvil-runtime-shell--fast-json-array-end s i))
+     ((or (eq c ?-) (and (>= c ?0) (<= c ?9)))
+      (anvil-runtime-shell--fast-json-number-end s i))
+     ((eq c ?t) (anvil-runtime-shell--fast-json-literal-end s i "true"))
+     ((eq c ?f) (anvil-runtime-shell--fast-json-literal-end s i "false"))
+     ((eq c ?n) (anvil-runtime-shell--fast-json-literal-end s i "null"))
+     (t nil))))
+
+(defun anvil-runtime-shell--fast-tools-json-problem (tools-json)
+  "Return nil when TOOLS-JSON is a plausible non-empty tools result.
+Otherwise return a short string describing the problem."
+  (if (not (stringp tools-json))
+      "cache value is not a string"
+    (let* ((n (length tools-json))
+           (start (anvil-runtime-shell--fast-json-skip-space tools-json 0))
+           (end (anvil-runtime-shell--fast-json-value-end tools-json start)))
+      (cond
+       ((or (not end)
+            (/= (anvil-runtime-shell--fast-json-skip-space tools-json end) n))
+        "cache value is not valid JSON")
+       ((or (>= start n) (not (eq (aref tools-json start) ?\{)))
+        "top-level JSON value is not an object")
+       (t
+        (let ((i (anvil-runtime-shell--fast-json-skip-space
+                  tools-json (1+ start)))
+              (found nil)
+              (problem nil)
+              (done nil))
+          (if (and (< i n) (eq (aref tools-json i) ?\}))
+              (setq done t)
+            (while (and (not done) (not problem))
+              (let* ((key-start i)
+                     (key-end
+                      (anvil-runtime-shell--fast-json-string-end
+                       tools-json key-start)))
+                (setq i (anvil-runtime-shell--fast-json-skip-space
+                         tools-json key-end))
+                (setq i (anvil-runtime-shell--fast-json-skip-space
+                         tools-json (1+ i)))
+                (when (string= (substring tools-json key-start key-end)
+                               "\"tools\"")
+                  (setq found t)
+                  (cond
+                   ((or (>= i n) (not (eq (aref tools-json i) ?\[)))
+                    (setq problem "tools value is not an array"))
+                   ((let ((first
+                           (anvil-runtime-shell--fast-json-skip-space
+                            tools-json (1+ i))))
+                      (and (< first n) (eq (aref tools-json first) ?\])))
+                    (setq problem "tools array is empty"))))
+                (unless problem
+                  (setq i (anvil-runtime-shell--fast-json-value-end tools-json i))
+                  (setq i (anvil-runtime-shell--fast-json-skip-space
+                           tools-json i))
+                  (cond
+                   ((eq (aref tools-json i) ?,)
+                    (setq i (anvil-runtime-shell--fast-json-skip-space
+                             tools-json (1+ i))))
+                   ((eq (aref tools-json i) ?\})
+                    (setq done t)))))))
+          (or problem (and (not found) "tools key is missing"))))))))
 
 (defun anvil-runtime-shell--plist-get (plist prop)
   "Small `plist-get' replacement available before `emacs-init.el'."
@@ -149,10 +471,58 @@ nil for production (silent).")
             (setq i (1+ i)))
           (if chars (apply #'string (nreverse chars)) "null")))))))
 
+(defvar anvil-runtime-shell--fast-dialect nil
+  "Wire dialect the fast handshake detected: `framed' or `ndjson'.
+Claude Code 2.1.138+ speaks NDJSON (one JSON object per line, no
+Content-Length header); older clients and the smoke scripts send
+Content-Length frames.  Decided by the first non-blank byte of stdin:
+`{' means NDJSON.")
+
+(defconst anvil-runtime-shell--crlf-crlf (string 13 10 13 10)
+  "CRLF CRLF: the MCP `Content-Length' header terminator.
+Spelled with character codes so no editing tool can flatten the
+escapes into real newlines -- which is exactly what happened on
+2026-09-04, shipping LF-only frame headers to the client.")
+
+(defconst anvil-runtime-shell--lf (string 10)
+  "A single LF: the NDJSON message terminator.")
+
 (defun anvil-runtime-shell--frame (body)
-  "Return BODY as a Content-Length MCP frame."
-  (let ((n (if (fboundp 'string-bytes) (string-bytes body) (length body))))
-    (concat "Content-Length: " (number-to-string n) "\r\n\r\n" body)))
+  "Return BODY on the wire in the detected dialect.
+A Content-Length frame, or BODY plus a newline under NDJSON.  Either way
+the wire carries BYTES: `Content-Length' counts bytes, and `length' on a
+multibyte string counts characters, so a non-ASCII answer framed from the
+character count is truncated by the client."
+  (let ((bytes (if (multibyte-string-p body)
+                   (if (fboundp 'nelisp--write-stderr-line)
+                       (string-as-unibyte body)
+                     (encode-coding-string body 'utf-8 t))
+                 body)))
+    (if (eq anvil-runtime-shell--fast-dialect 'ndjson)
+        (concat bytes anvil-runtime-shell--lf)
+      (concat "Content-Length: " (number-to-string (length bytes))
+              anvil-runtime-shell--crlf-crlf bytes))))
+
+(defun anvil-runtime-shell--multibyte (s)
+  "Return S as a multibyte (decoded UTF-8) string when the reader can.
+Stdin arrives as raw bytes; on the Linux reader an `equal' hash lookup
+with a unibyte key misses a multibyte key (measured 2026-09-04: every
+tools/call answered \"Tool not found\"), and non-ASCII arguments need
+the decode anyway."
+  (cond
+   ((not (stringp s)) s)
+   ;; `anvil-server--utf8-bytes-to-string' validates the bytes and covers
+   ;; host Emacs too, so prefer it once anvil-server.el is loaded.  It
+   ;; signals on malformed input, which a raw read chunk split mid
+   ;; sequence legitimately is, so fall back rather than fail.
+   ((fboundp 'anvil-server--utf8-bytes-to-string)
+    (condition-case nil
+        (anvil-server--utf8-bytes-to-string s)
+      (error (if (fboundp 'string-as-multibyte)
+                 (funcall 'string-as-multibyte s)
+               s))))
+   ((fboundp 'string-as-multibyte) (funcall 'string-as-multibyte s))
+   (t s)))
 
 (defun anvil-runtime-shell--stdout (s)
   "Write S to stdout using the standalone byte writer when present."
@@ -165,12 +535,62 @@ nil for production (silent).")
   (let ((chunk (and (fboundp 'read-stdin-bytes)
                     (read-stdin-bytes 4096))))
     (when (and (stringp chunk) (> (length chunk) 0))
+      (when (multibyte-string-p chunk)
+        (setq chunk (string-as-unibyte chunk)))
       (setq anvil-runtime-shell--fast-stdin-buffer
             (concat anvil-runtime-shell--fast-stdin-buffer chunk))
       t)))
 
+(defun anvil-runtime-shell--fast-detect-dialect ()
+  "Set `anvil-runtime-shell--fast-dialect' from the first non-blank byte.
+Refills stdin until one is seen; nil on EOF."
+  (let ((found nil)
+        (done nil))
+    (while (and (not found) (not done))
+      (let ((i 0)
+            (buf anvil-runtime-shell--fast-stdin-buffer))
+        (while (and (< i (length buf))
+                    (let ((c (aref buf i)))
+                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
+          (setq i (1+ i)))
+        (if (< i (length buf))
+            (setq found (if (eq (aref buf i) ?{) 'ndjson 'framed))
+          (setq done (not (anvil-runtime-shell--fast-refill))))))
+    (when found
+      (setq anvil-runtime-shell--fast-dialect found))
+    found))
+
+(defun anvil-runtime-shell--fast-read-ndjson ()
+  "Read one NDJSON body (a line holding a JSON object), or nil at EOF."
+  (let ((nl-pos nil)
+        (done nil))
+    (while (and (not done)
+                (not (setq nl-pos
+                           (anvil-runtime-shell--substr-pos
+                            anvil-runtime-shell--fast-stdin-buffer "\n"))))
+      (setq done (not (anvil-runtime-shell--fast-refill))))
+    (when nl-pos
+      (let ((line (substring anvil-runtime-shell--fast-stdin-buffer 0 nl-pos)))
+        (setq anvil-runtime-shell--fast-stdin-buffer
+              (substring anvil-runtime-shell--fast-stdin-buffer (1+ nl-pos)))
+        (when (and (> (length line) 0)
+                   (eq (aref line (1- (length line))) ?\r))
+          (setq line (substring line 0 -1)))
+        (if (= (length line) 0)
+            (anvil-runtime-shell--fast-read-ndjson)
+          line)))))
+
 (defun anvil-runtime-shell--fast-read-frame ()
-  "Read one MCP frame body using only standalone primitives."
+  "Read one MCP request body using only standalone primitives.
+Detects the dialect on first use; Content-Length frames or NDJSON lines."
+  (unless anvil-runtime-shell--fast-dialect
+    (anvil-runtime-shell--fast-detect-dialect))
+  (if (eq anvil-runtime-shell--fast-dialect 'ndjson)
+      (anvil-runtime-shell--fast-read-ndjson)
+    (anvil-runtime-shell--fast-read-framed)))
+
+(defun anvil-runtime-shell--fast-read-framed ()
+  "Read one Content-Length frame body using only standalone primitives."
   (let ((sep-pos nil)
         (done nil))
     (while (and (not done)
@@ -214,23 +634,43 @@ nil for production (silent).")
                                (+ body-start n)))
               body)))))))
 
-(defun anvil-runtime-shell--fast-tools-result (fast-file)
-  "Return a precomputed `tools/list' result JSON from FAST-FILE, or nil."
-  (let ((anvil-runtime-shell--fast-tools-json nil))
+(defun anvil-runtime-shell--fast-tools-result (fast-file &optional modules)
+  "Return a precomputed `tools/list' result JSON from FAST-FILE, or nil.
+Nil also when the file was written for a module list other than MODULES."
+  (let ((anvil-runtime-shell--fast-tools-json nil)
+        (anvil-runtime-shell--fast-tools-modules nil))
     (condition-case nil
         (progn
           (anvil-runtime-shell--fast-log "[FAST] load fast tools")
           (load fast-file t t)
-          (when (stringp anvil-runtime-shell--fast-tools-json)
-            (anvil-runtime-shell--fast-log "[FAST] fast tools loaded")
-            anvil-runtime-shell--fast-tools-json))
+          (let ((problem
+                 (anvil-runtime-shell--fast-tools-json-problem
+                  anvil-runtime-shell--fast-tools-json)))
+            (cond
+             (problem
+              (anvil-runtime-shell--fast-warn
+               (concat "refusing tools cache " fast-file ": " problem))
+              nil)
+             ((and anvil-runtime-shell--fast-tools-modules
+                   (not (equal anvil-runtime-shell--fast-tools-modules
+                               modules)))
+              (anvil-runtime-shell--fast-log
+               "[FAST] fast tools are for another module set")
+              nil)
+             (t
+              (anvil-runtime-shell--fast-log "[FAST] fast tools loaded")
+              anvil-runtime-shell--fast-tools-json))))
       (error
-       (anvil-runtime-shell--fast-log "[FAST] fast tools unavailable")
+       (when (file-exists-p fast-file)
+         (anvil-runtime-shell--fast-warn
+          (concat "refusing tools cache " fast-file
+                  ": cache file could not be loaded")))
        nil))))
 
-(defun anvil-runtime-shell--fast-handshake (fast-file)
-  "Serve initialize/tools-list directly from FAST-FILE before full load."
-  (let ((tools-json (anvil-runtime-shell--fast-tools-result fast-file))
+(defun anvil-runtime-shell--fast-handshake (fast-file &optional modules)
+  "Serve initialize/tools-list directly from FAST-FILE before full load.
+MODULES is the current `ANVIL_TOOL_MODULES' value the file must match."
+  (let ((tools-json (anvil-runtime-shell--fast-tools-result fast-file modules))
         (keep-going t)
         (served nil))
     (when tools-json
@@ -301,6 +741,12 @@ nil for production (silent).")
              (concat (file-name-directory
                       (directory-file-name anvil-el-dir))
                      "nelisp-emacs"))))
+       (nelisp-lisp-dir
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
+                 (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
+                 anvil-runtime-bootstrap-nelisp-lisp-dir)
+            (concat (file-name-directory (directory-file-name anvil-el-dir))
+                    "nelisp/lisp")))
        (server-id
         ;; Default `emacs-eval' matches the constant used by every
         ;; GREEN-bucket anvil-* module's `--server-id'.  Tools register
@@ -313,12 +759,63 @@ nil for production (silent).")
        (metrics-el (concat anvil-el-dir "/anvil-server-metrics.el"))
        (server-el (concat anvil-el-dir "/anvil-server.el"))
        (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el"))
-       (fast-tools-file "/tmp/anvil-runtime/anvil-fast-tools.el"))
+       ;; State dir: bin/anvil-runtime creates it (default ~/.anvil-runtime)
+       ;; and passes it through the bootstrap.  The old fixed
+       ;; "/tmp/anvil-runtime" stays as the last-resort default for
+       ;; host-Emacs test loads; it does not exist for the native
+       ;; windows-x86_64 reader (NeLisp v1.2.0).
+       (state-dir
+        (or (and (boundp 'anvil-runtime-bootstrap-state-dir)
+                 anvil-runtime-bootstrap-state-dir)
+            (anvil-runtime-shell--env "ANVIL_RUNTIME_DAEMON_DIR"
+                                      "/tmp/anvil-runtime")))
+       (fast-tools-file (concat state-dir "/anvil-fast-tools.el"))
+       ;; Resolved once, pre-init, while `getenv' is still the reader's
+       ;; native one; reused by the module chain below.
+       (modules-env (anvil-runtime-shell--env
+                     "ANVIL_TOOL_MODULES" anvil-runtime-shell--default-modules))
+       (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el"))
+       (bootstrap-skip-features
+        '(nelisp-coding-jis-tables calendar
+          subr-x seq cl-extra cl-seq benchmark profiler
+          emacs-syntax-table emacs-elisp-mode emacs-mode emacs-mode-builtins
+          emacs-font-lock-builtins emacs-faces-builtins emacs-textmodes-stub
+          emacs-redisplay-builtins emacs-tui-event emacs-tui-backend
+          emacs-frame-builtins emacs-window-builtins emacs-keymap-builtins
+          emacs-command-loop-builtins
+          emacs-frame emacs-window keymap emacs-faces emacs-font-lock)))
 
-  (when (and (not anvil-server--debug-trace)
+  ;; Safety gate.  Measured on this machine on 2026-08-29: stdout was correct
+  ;; in every fast-path run (5,208 bytes and six tools), but every process
+  ;; terminated with exit 1 or SIGSEGV after 2--20 s, at HEAD db57796 too.
+  ;;
+  ;; RESOLVED the same day.  The cause was not in this file: two defects in
+  ;; the standalone NeLisp GC, both fixed in nelisp's
+  ;; `scripts/nelisp-standalone-build.el' -- a char-table/vector slot walk
+  ;; that trusted a length it had read out of an uninitialised parse-pool
+  ;; slot, and a per-frame parse-pool capacity read from a global word that
+  ;; names whichever load is innermost.  The fast handshake never was the
+  ;; affected path; with ASLR disabled the ordinary load path below
+  ;; segfaulted just as reliably.  See
+  ;; `Notes/dev/BUG-nelisp-layout-dependent-crash-2026-08-29.md'.
+  ;;
+  ;; The re-enable criterion this comment used to state -- repeated plain
+  ;; runs exiting 0 with ASLR both enabled and disabled -- is met against a
+  ;; NeLisp built at or after that fix: 3/3 with `setarch -R' and 3/3 plain,
+  ;; each returning the full 5,208 bytes.  `bin/anvil-runtime' now defaults
+  ;; the gate ON for that reason, and writes the decision into the bootstrap
+  ;; it generates.
+  ;;
+  ;; It is NOT met against an older binary, which is what
+  ;; `ANVIL_RUNTIME_FAST_HANDSHAKE=0' exists for.  Note the env var reaches
+  ;; the runtime only through that generated bootstrap: reading it here would
+  ;; not work, because this `defvar' runs before `emacs-callproc.el' provides
+  ;; `getenv', so the env channel is host-Emacs only.
+  (when (and anvil-runtime-shell--fast-handshake-enabled
+             (not anvil-server--debug-trace)
              (fboundp 'read-stdin-bytes)
              (fboundp 'nelisp--write-stdout-bytes))
-    (anvil-runtime-shell--fast-handshake fast-tools-file))
+    (anvil-runtime-shell--fast-handshake fast-tools-file modules-env))
 
   ;; Bootstrap layer 2 + json / backquote fixes.
   ;; emacs-init.el gates its vendor load-path setup on
@@ -331,7 +828,6 @@ nil for production (silent).")
   ;; Phase 47 native swap), which aborts with glibc "double free or
   ;; corruption (!prev)" on that file.  MCP / JSON-RPC is UTF-8 only,
   ;; so the JIS tables are deadweight here.
-  (provide 'nelisp-coding-jis-tables)
   ;; Pre-provide the 6 vendor libs that `anvil-runtime-polyfills.el'
   ;; tries to `(load ...)' below.  Under the post-2026-05-17 nelisp the
   ;; pure-elisp interpreter allocates ~1 MB/s while walking those files
@@ -340,8 +836,6 @@ nil for production (silent).")
   ;; NeLisp's permissive `require' silently succeeds for already-provided
   ;; features, so downstream `(require 'subr-x)' etc are satisfied
   ;; without ever touching the vendor files.
-  (dolist (lib '(subr-x seq cl-extra cl-seq benchmark profiler))
-    (provide lib))
   ;; HEADLESS editor/UI skip (standalone NeLisp cold-load ~76s -> ~36s).
   ;; `bin/anvil-runtime mcp serve' is always headless JSON-RPC over stdio: it
   ;; never opens a frame, syntax table, font-lock buffer or TUI event loop.
@@ -352,20 +846,89 @@ nil for production (silent).")
   ;; minibuffer / string / hash / fns / eval / callproc / sqlite — anvil-server
   ;; depends on those.  If a tool handler ever needs one of the skipped
   ;; features, drop it from this list (it will then load on demand).
-  (dolist (f '(emacs-syntax-table emacs-elisp-mode emacs-mode emacs-mode-builtins
-               emacs-font-lock-builtins emacs-faces-builtins emacs-textmodes-stub
-               emacs-redisplay-builtins emacs-tui-event emacs-tui-backend
-               emacs-frame-builtins emacs-window-builtins emacs-keymap-builtins
-               emacs-command-loop-builtins
-               emacs-frame emacs-window keymap emacs-faces emacs-font-lock))
-    (provide f))
-  ;; Prefer .el over .elc — post-2026-05-17 nelisp's stdlib-misc swaps
-  ;; the elisp Reader to a pure-elisp form that cannot parse `#[..]'
-  ;; byte-compiled lambdas or `#s(..)' record syntax that .elc files
-  ;; contain.  Without this, stale .elc files in nelisp-emacs/src/ and
-  ;; anvil.el/ silently override their .el siblings and explode after
-  ;; stdlib-misc loads.
+  ;; Populate the native feature registry before stdlib-misc replaces
+  ;; `provide'.  Measured 2026-08-29: omitting this pre-pass made the
+  ;; standalone process exit 139 immediately after `[STEP] pre-init'.
+  (dolist (feature bootstrap-skip-features)
+    (provide feature))
+  ;; Keep the runtime's established source-first loading policy.
   (setq load-prefer-newer t)
+  ;; `temporary-file-directory': nelisp-emacs's emacs-vars.el falls back
+  ;; to "/tmp/", which does not exist for the native windows-x86_64
+  ;; reader, so anvil-server's schema cache could never be written there
+  ;; and every start paid the eager schema path.  Bind it under the
+  ;; launcher's state dir (bin/anvil-runtime creates `<state>/tmp')
+  ;; before emacs-vars.el's `unless boundp' guard runs.  Only when the
+  ;; substrate left it unbound — a reader that ships its own value wins.
+  (unless (boundp 'temporary-file-directory)
+    (defvar temporary-file-directory (concat state-dir "/tmp/")))
+  ;; NeLisp v1.2.0: the reader's `load' does not bind `load-file-name'
+  ;; for the file it is loading, so emacs-init.el's "put my own src/ on
+  ;; load-path" step (which keys on `load-file-name') is a no-op and its
+  ;; first `(require 'nelisp-emacs)' dies with file-missing.  Surface
+  ;; the Layer 2 src/ dir explicitly; harmless where the reader already
+  ;; binds the variable.
+  (let ((src-dir (concat nelisp-emacs-dir "/src")))
+    (unless (and (boundp 'load-path) (member src-dir load-path))
+      (setq load-path (cons src-dir (and (boundp 'load-path) load-path)))))
+  ;; The ~300x JSON slowdown reported on 2026-05-24 was re-measured on
+  ;; this machine on 2026-08-28 and did not reproduce: across nine
+  ;; 25--10000-byte payload sizes (14 samples each), median with/without
+  ;; ratios were 0.9435x--1.0722x.  A 10 KB call-count probe recorded zero
+  ;; calls to `list', `error', `princ', `provide', and `load'; the parser
+  ;; loaded by anvil-server's `(require 'json)' does not use those replaced
+  ;; functions.  That series still measured a separate superlinear parser
+  ;; curve from 300--10000 bytes (log-log exponent 1.450; 10 KB median
+  ;; 4285.132 ms with stdlib-misc), which this bootstrap does not address.
+  ;; Load stdlib-misc before emacs-init: the same-machine probe measured
+  ;; `load-file-name' nil inside a primitive load and non-nil with this
+  ;; implementation.
+  ;; The stdlib-misc chain below is OPT-IN, default off.
+  ;;
+  ;; It was written for the pre-v1.2 runtime, where `load' left
+  ;; `load-file-name' nil and stdlib-misc supplied the coding-system and
+  ;; hash-traversal fixes.  NeLisp v1.2.1's prelude carries those fixes
+  ;; itself, and loading stdlib-misc on top of it is not free: measured
+  ;; 2026-09-04 on the windows-x86_64 reader, `(load init-el)' never
+  ;; returned -- a 600 s stdio run stalled after `[STEP] pre-init' with
+  ;; no output, where the same tree without this chain answered
+  ;; `tools/list' normally.  Set ANVIL_RUNTIME_STDLIB_MISC=1 to restore
+  ;; it for a runtime that still needs it.
+  (when (and (boundp 'anvil-runtime-bootstrap-stdlib-misc)
+             anvil-runtime-bootstrap-stdlib-misc
+             (file-exists-p stdlib-misc))
+    (setq anvil-runtime-shell--primitive-load (symbol-function 'load))
+    (setq anvil-runtime-shell--primitive-hash-functions
+          (mapcar (lambda (name) (cons name (symbol-function name)))
+                  '(maphash hash-table-keys hash-table-values hash-table-count)))
+    (load stdlib-misc nil t)
+    ;; Measured 2026-08-29: stdlib-misc's four hash traversal wrappers call
+    ;; `nelisp--hash-pairs', which this standalone image does not define;
+    ;; `anvil-server-start' consequently failed in `clrhash'.  Keep the
+    ;; image's working native implementations while loading the rest of
+    ;; stdlib-misc.
+    (let ((saved anvil-runtime-shell--primitive-hash-functions))
+      (while saved
+        (fset (car (car saved)) (cdr (car saved)))
+        (setq saved (cdr saved))))
+    ;; Measured 2026-08-29: stdlib-misc's `load' could not resolve an
+    ;; existing absolute /tmp source and its incremental reader treated
+    ;; emacs-stub.el's `#x3FFFFF' as a variable.  The saved native loader
+    ;; parsed that chain while this wrapper supplied non-nil `load-file-name'.
+    ;; The same probe reached vendor calendar's cal-loaddefs.el and then
+    ;; exited 139, so skip only that exact vendor body; the local calendar
+    ;; facade and emacs-time.el had both completed before the failing load.
+    (setq anvil-runtime-shell--skip-load-files
+          (list (concat nelisp-emacs-dir
+                        "/vendor/emacs-lisp/calendar/calendar.el")))
+    (fset 'load #'anvil-runtime-shell--compat-load)
+    )
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] stdlib-misc done"))
+  ;; Populate stdlib-misc's `features' list with the same set.  The
+  ;; 2026-08-29 probe recorded `(featurep 'calendar)' as t here.
+  (dolist (feature bootstrap-skip-features)
+    (provide feature))
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] pre-init"))
   (load init-el nil t)
@@ -393,23 +956,34 @@ nil for production (silent).")
   ;; degrade ~300x on strings > 75 bytes (bisected 2026-05-24).  By
   ;; inlining just this one defun we get the alist-get fix without
   ;; clobbering the Rust-fast primitives the rest of anvil needs.
-  (defun alist-get (key alist &optional default _remove testfn)
-    (let ((cur alist) (found nil) (result default))
-      (while (and cur (not found))
-        (let ((pair (car cur)))
-          (cond
-           ((not (consp pair)) (setq cur (cdr cur)))
-           ((cond
-             ((null testfn) (equal (car pair) key))
-             ((eq testfn 'eq) (eq (car pair) key))
-             ((eq testfn 'equal) (equal (car pair) key))
-             ((or (eq testfn 'string=) (eq testfn 'string-equal))
-              (and (stringp (car pair)) (stringp key) (equal (car pair) key)))
-             (t (funcall testfn (car pair) key)))
-            (setq result (cdr pair))
-            (setq found t))
-           (t (setq cur (cdr cur))))))
-      result))
+  ;;
+  ;; NeLisp v1.2.0: the prelude ships a correct `alist-get', so the
+  ;; override is gated on a functional probe — it only lands when the
+  ;; running definition is missing or answers wrong (= the legacy
+  ;; baked-image case this block was written for).
+  (unless (and (fboundp 'alist-get)
+               (condition-case nil
+                   (and (equal (alist-get 'b '((a . 1) (b . 2))) 2)
+                        (eq (alist-get 'z '((a . 1)) 'dflt) 'dflt)
+                        (equal (alist-get "k" '(("k" . 3)) nil nil #'equal) 3))
+                 (error nil)))
+    (defun alist-get (key alist &optional default _remove testfn)
+      (let ((cur alist) (found nil) (result default))
+        (while (and cur (not found))
+          (let ((pair (car cur)))
+            (cond
+             ((not (consp pair)) (setq cur (cdr cur)))
+             ((cond
+               ((null testfn) (equal (car pair) key))
+               ((eq testfn 'eq) (eq (car pair) key))
+               ((eq testfn 'equal) (equal (car pair) key))
+               ((or (eq testfn 'string=) (eq testfn 'string-equal))
+                (and (stringp (car pair)) (stringp key) (equal (car pair) key)))
+               (t (funcall testfn (car pair) key)))
+              (setq result (cdr pair))
+              (setq found t))
+             (t (setq cur (cdr cur))))))
+        result)))
 
   ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
   ;; / `(require 'anvil-orchestrator-presets)' / etc. inside tool-module
@@ -426,9 +1000,31 @@ nil for production (silent).")
   (load server-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] server-el done"))
+  ;; Keep the schema cache next to the fast-handshake cache so one state
+  ;; dir holds every persisted artefact of a standalone deployment.
+  (when (boundp 'anvil-server-schema-cache-file)
+    (setq anvil-server-schema-cache-file
+          (concat state-dir "/anvil-schema-cache.el")))
   (load server-commands-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] server-commands-el done"))
+  ;; User config (`$ANVIL_CONFIG_DIR/config.el', XDG fallback).  README
+  ;; documents it as THE config source of the standalone path, but only
+  ;; anvil-host pulls anvil-config in, so this chain never read it.  Load
+  ;; it here, after anvil-server is real so the shim layer anvil-config
+  ;; requires stays inert, and before the tool modules so machine-specific
+  ;; pins such as `anvil-worklog-db-path' / `anvil-memory-db-path' are in
+  ;; place when their `defcustom's run.  A missing file is silent; a broken
+  ;; one is reported by anvil-config itself and never aborts the server.
+  (condition-case err
+      (require 'anvil-config nil t)
+    (error
+     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+       (nelisp--write-stderr-line
+        (concat "[shell-loop] anvil-config load ERR: " (format "%S" err))))))
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] anvil-config done"))
+
 
   ;; stdin shim — anvil-server-run-batch-stdio reads frames via
   ;; `read-from-minibuffer'; emacs-stdio.el's installer overrides the
@@ -436,6 +1032,21 @@ nil for production (silent).")
   (load stdio-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] stdio-el done"))
+  ;; Measured 2026-08-28 on NeLisp v1.1.0+1: `read-stdin-bytes'
+  ;; returned "日本語" as multibyte with length 3 and string-bytes 9.
+  ;; Normalize every refill so the stdio reader's length and substring
+  ;; arithmetic stays in MCP wire bytes.
+  (defun emacs-stdio--refill ()
+    "Read stdin into `emacs-stdio--buffer' as unibyte wire bytes."
+    (let ((chunk (read-stdin-bytes emacs-stdio--chunk-size)))
+      (cond
+       ((null chunk) nil)
+       ((and (stringp chunk) (= (length chunk) 0)) nil)
+       (t
+        (when (multibyte-string-p chunk)
+          (setq chunk (string-as-unibyte chunk)))
+        (setq emacs-stdio--buffer (concat emacs-stdio--buffer chunk))
+        t))))
   (when (boundp 'emacs-stdio--buffer)
     (setq emacs-stdio--buffer
           (concat anvil-runtime-shell--fast-stdin-buffer
@@ -443,6 +1054,13 @@ nil for production (silent).")
     (setq anvil-runtime-shell--fast-stdin-buffer ""))
   (when (fboundp 'emacs-stdio-install-stdin-shim)
     (emacs-stdio-install-stdin-shim))
+  ;; Every line the server reads (NDJSON requests, framed headers) comes
+  ;; back from the shim as raw stdin bytes; hand them over decoded.
+  (when (fboundp 'read-from-minibuffer)
+    (let ((orig (symbol-function 'read-from-minibuffer)))
+      (fset 'read-from-minibuffer
+            (lambda (&rest args)
+              (anvil-runtime-shell--multibyte (apply orig args))))))
 
   ;; Substrate polyfills (cl-* gaps + sqlite cursor protocol +
   ;; benchmark/profiler stubs) for anvil-* GREEN-bucket modules.
@@ -553,13 +1171,9 @@ case-insensitively, returns the integer value or nil."
   (defun anvil-server-mcp-frame-encode (body)
     "Phase B5 Stage 1b override — emit `Content-Length: N\r\n\r\nBODY'.
 N is the UTF-8 byte length of BODY."
-    (let* ((bytes (if (fboundp 'encode-coding-string)
-                      (encode-coding-string body 'utf-8 t)
-                    body))
-           (n (if (fboundp 'string-bytes)
-                  (string-bytes bytes)
-                (length bytes))))
-      (concat "Content-Length: " (number-to-string n) "\r\n\r\n" body)))
+    (let* ((bytes (anvil-server--string-to-utf8-bytes body))
+           (n (length bytes)))
+      (concat "Content-Length: " (number-to-string n) "\r\n\r\n" bytes)))
 
   ;; Override the framed-with-prefix reader entirely.  The original uses
   ;; `replace-regexp-in-string' for trailing-CR strip, which is a no-op
@@ -592,7 +1206,8 @@ head of the next header line."
         (when (and n (>= n 0))
           (let ((body (and (fboundp 'emacs-stdio-read-bytes)
                            (emacs-stdio-read-bytes n))))
-            (and body (> (length body) 0) body))))))
+            (and body (> (length body) 0)
+                 (anvil-runtime-shell--multibyte body)))))))
 
   (defun anvil-server--batch-read-framed-message ()
     "Phase B5 Stage 1b override — used on subsequent loop iterations.
@@ -612,22 +1227,83 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
         (setq line (ignore-errors (read-from-minibuffer ""))))
       line))
 
+  ;; Module -> tool-id map learned from real registrations.  The static
+  ;; table below only knows the three original modules; anything else
+  ;; (anvil-state / anvil-memory / anvil-worklog once the reader has a
+  ;; sqlite backend, 2026-09-04) used to be silently skipped on the lazy
+  ;; path because no loader could be attributed to its tools.  Each eager
+  ;; load now records which ids a module added and persists the map
+  ;; under the state dir, so the next start can serve those tools lazily
+  ;; from the schema cache like the original three.
+  (defvar anvil-runtime-shell--module-tools-learned nil
+    "Alist (MODULE-NAME . TOOL-IDS) learned from eager module loads.")
+  (defvar anvil-runtime-shell--module-tools-file
+    (concat state-dir "/anvil-module-tools.el")
+    "Self-loading `(setq ...)' file persisting the learned map.")
+  (condition-case nil
+      (load anvil-runtime-shell--module-tools-file t t)
+    (error nil))
+
   (defun anvil-runtime-shell--module-tool-ids (module-name)
-    "Return the default MCP tool ids registered by MODULE-NAME."
-    (cond
-     ((string= module-name "anvil-discovery")
-      '("anvil-tools-by-intent" "anvil-tools-usage-report"))
-     ((string= module-name "anvil-sqlite")
-      '("sqlite-query"))
-     ((string= module-name "anvil-bench")
-      '("bench-compare" "bench-profile-expr" "bench-last"))
-     (t nil)))
+    "Return the MCP tool ids registered by MODULE-NAME, or nil if unknown."
+    (or (cdr (assoc module-name anvil-runtime-shell--module-tools-learned))
+        (cond
+         ((string= module-name "anvil-discovery")
+          '("anvil-tools-by-intent" "anvil-tools-usage-report"))
+         ((string= module-name "anvil-sqlite")
+          '("sqlite-query"))
+         ((string= module-name "anvil-bench")
+          '("bench-compare" "bench-profile-expr" "bench-last"))
+         (t nil))))
+
+  (defun anvil-runtime-shell--registered-tool-ids ()
+    "Return the tool ids currently registered under `server-id'."
+    (let ((bucket (and (boundp 'anvil-server--tools)
+                       (gethash server-id anvil-server--tools))))
+      (if bucket (hash-table-keys bucket) nil)))
+
+  (defun anvil-runtime-shell--tools-list-json ()
+    "Return the tools/list result object as JSON for `server-id'.
+Same concat of per-tool `:json-fragment's the real handler performs;
+rebuilt here because the handler deliberately does not populate its
+request cache on standalone, and the fast-handshake file must carry
+the cached placeholders AND whatever was eagerly registered."
+    (let ((bucket (and (boundp 'anvil-server--tools)
+                       (gethash server-id anvil-server--tools)))
+          (frags nil))
+      (when bucket
+        (maphash (lambda (_id tool)
+                   (let ((f (plist-get tool :json-fragment)))
+                     (when (stringp f) (push f frags))))
+                 bucket))
+      (and frags
+           (concat "{\"tools\":["
+                   (mapconcat #'identity (nreverse frags) ",")
+                   "]}"))))
+
+  (defun anvil-runtime-shell--remember-module-tools (module-name ids)
+    "Record that MODULE-NAME registered IDS and persist the map."
+    (when ids
+      (setq anvil-runtime-shell--module-tools-learned
+            (cons (cons module-name ids)
+                  (assoc-delete-all module-name
+                                    anvil-runtime-shell--module-tools-learned)))
+      (when (fboundp 'write-region)
+        (condition-case nil
+            (write-region
+             (concat ";; anvil-runtime module -> tool ids (auto-generated)\n"
+                     "(setq anvil-runtime-shell--module-tools-learned '"
+                     (prin1-to-string anvil-runtime-shell--module-tools-learned)
+                     ")\n")
+             nil anvil-runtime-shell--module-tools-file)
+          (error nil)))))
 
   (defun anvil-runtime-shell--load-tool-module (module-name)
     "Load MODULE-NAME from `anvil-el-dir' and call its enable function."
     (anvil-runtime-shell--ensure-polyfills-loaded)
     (let* ((file (concat anvil-el-dir "/" module-name ".el"))
-           (enable-sym (intern (concat module-name "-enable"))))
+           (enable-sym (intern (concat module-name "-enable")))
+           (before (anvil-runtime-shell--registered-tool-ids)))
       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
         (nelisp--write-stderr-line
          (concat "[shell-loop] loading " file)))
@@ -637,7 +1313,14 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
          (concat "[shell-loop] " (symbol-name enable-sym)
                  " fboundp=" (if (fboundp enable-sym) "t" "nil"))))
       (when (fboundp enable-sym)
-        (funcall enable-sym))
+        (funcall enable-sym)
+        ;; Only ids that appeared during this load, minus placeholders
+        ;; the lazy path registered earlier for the same module.
+        (let ((added nil))
+          (dolist (id (anvil-runtime-shell--registered-tool-ids))
+            (unless (member id before)
+              (push id added)))
+          (anvil-runtime-shell--remember-module-tools module-name added)))
       ;; Post-load substrate patches (= anvil-sqlite regex compat etc).
       ;; In lazy mode modules load one at a time, so run the patches after
       ;; each successful module load instead of once after an eager chain.
@@ -666,31 +1349,30 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
   ;; process-environment stops being a stub-empty (Phase 1.6 keeps it
   ;; nil so getenv returns nil regardless of OS env), but for now the
   ;; default carries the actual list.
-  (let* ((modules-env (anvil-runtime-shell--env
-                       "ANVIL_TOOL_MODULES"
-                       ;; Default trimmed 2026-05-24 from 7 → 3 modules.
-                       ;; Under post-2026-05-17 nelisp without built-in
-                       ;; sqlite, `anvil-state' / `anvil-memory' /
-                       ;; `anvil-worklog' / `anvil-org-index' all fail
-                       ;; at their *-enable step with "sqlite not
-                       ;; available", registering zero tools.  Loading
-                       ;; them anyway burned 63 % of cold-load time
-                       ;; (~13 of ~20 min) on the pure-elisp interpreter
-                       ;; before failing.  Set ANVIL_TOOL_MODULES
-                       ;; explicitly to re-enable any of them once nelisp
-                       ;; ships a sqlite primitive.
-                       "anvil-discovery,anvil-sqlite,anvil-bench")))
+  ;; `modules-env' was resolved pre-init above.  Default trimmed
+  ;; 2026-05-24 from 7 to 3 modules when the reader had no sqlite; since
+  ;; 2026-09-04 the DB-backed modules work again (Doc 138 SQLite arm) and
+  ;; are opted in through ANVIL_TOOL_MODULES -- see
+  ;; `anvil-runtime-shell--default-modules'.
+  (progn
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[shell-loop] ANVIL_TOOL_MODULES="
                (if (> (length modules-env) 0) modules-env "<empty>"))))
     (when (> (length modules-env) 0)
       (let ((module-names nil)
-            (lazy-loaders nil))
+            (lazy-loaders nil)
+            (eager-names nil))
         (dolist (name (split-string modules-env "," t))
-          (let ((trimmed (if (fboundp 'string-trim) (string-trim name) name)))
+          (let* ((trimmed (if (fboundp 'string-trim) (string-trim name) name))
+                 (ids (anvil-runtime-shell--module-tool-ids trimmed)))
             (push trimmed module-names)
-            (dolist (tool-id (anvil-runtime-shell--module-tool-ids trimmed))
+            ;; A module whose tool ids are not known yet cannot be served
+            ;; lazily; load it eagerly so its tools still exist, and so
+            ;; the load records its ids for next time.
+            (unless ids
+              (push trimmed eager-names))
+            (dolist (tool-id ids)
               (let ((module-name trimmed))
                 (push
                  (cons tool-id
@@ -698,30 +1380,55 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
                          (anvil-runtime-shell--load-tool-module module-name)))
                  lazy-loaders)))))
         (setq module-names (nreverse module-names))
+        (setq eager-names (nreverse eager-names))
         (let ((lazy-count
                (and (fboundp 'anvil-server-register-cached-tool-fragments)
                     (anvil-server-register-cached-tool-fragments
                      server-id lazy-loaders))))
           (cond
            ((and lazy-count (> lazy-count 0))
-            (let ((tools-json
-                   (and (boundp 'anvil-server--tools-list-cache)
-                        (gethash server-id anvil-server--tools-list-cache))))
-              (when (and (stringp tools-json)
-                         (fboundp 'write-region))
+            (dolist (trimmed eager-names)
+              (condition-case err
+                  (anvil-runtime-shell--load-tool-module trimmed)
+                (error
+                 (when (and anvil-server--debug-trace
+                            (fboundp 'nelisp--write-stderr-line))
+                   (nelisp--write-stderr-line
+                    (concat "[shell-loop] " trimmed
+                            " eager load/enable ERR: "
+                            (format "%S" err)))))))
+            ;; The fast-handshake file must advertise the FULL list:
+            ;; the cached fragments plus whatever the eager loads above
+            ;; registered.  Rebuild it through the real tools/list
+            ;; handler rather than the fragments-only cache entry, and
+            ;; refuse to write a cache that would not survive reload.
+            (let* ((tools-json (anvil-runtime-shell--tools-list-json))
+                   (problem (anvil-runtime-shell--fast-tools-json-problem
+                             tools-json)))
+              (cond
+               (problem
+                (anvil-runtime-shell--fast-warn
+                 (concat "refusing to write tools cache " fast-tools-file
+                         ": " problem)))
+               ((fboundp 'write-region)
                 (condition-case nil
                     (write-region
                      (concat
+                      "(setq anvil-runtime-shell--fast-tools-modules '"
+                      (prin1-to-string modules-env)
+                      ")
+"
                       "(setq anvil-runtime-shell--fast-tools-json '"
                       (prin1-to-string tools-json)
-                      ")\n")
+                      ")
+")
                      nil fast-tools-file)
-                  (error nil))))
+                  (error nil)))))
             (when (and anvil-server--debug-trace
                        (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
-               (format "[shell-loop] lazy cached tool fragments=%d"
-                       lazy-count))))
+               (format "[shell-loop] lazy cached tool fragments=%d eager=%S"
+                       lazy-count eager-names))))
            (t
             ;; Cache missing or empty: fall back to the old eager path so a
             ;; first-ever run can still generate and persist schema cache.
@@ -734,7 +1441,23 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
                    (nelisp--write-stderr-line
                     (concat "[shell-loop] " trimmed
                             " load/enable ERR: "
-                            (format "%S" err)))))))))))))
+                            (format "%S" err)))))))
+            ;; Leave the fast-handshake file behind as well, so the very
+            ;; next start answers initialize / tools/list before its own
+            ;; init instead of paying one more full load for that.
+            (let ((tools-json (anvil-runtime-shell--tools-list-json)))
+              (when (and (stringp tools-json) (fboundp 'write-region))
+                (condition-case nil
+                    (write-region
+                     (concat
+                      "(setq anvil-runtime-shell--fast-tools-modules '"
+                      (prin1-to-string modules-env)
+                      ")\n"
+                      "(setq anvil-runtime-shell--fast-tools-json '"
+                      (prin1-to-string tools-json)
+                      ")\n")
+                     nil fast-tools-file)
+                  (error nil))))))))))
 
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (let ((bucket (and (boundp 'anvil-server--tools)
@@ -754,10 +1477,32 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
     (anvil-server-start)
     (let ((resp
            (anvil-server-process-jsonrpc
-            anvil-runtime-shell--fast-pending-body server-id)))
-      (anvil-server--batch-emit-response resp t))
+            (anvil-runtime-shell--multibyte anvil-runtime-shell--fast-pending-body)
+            server-id)))
+      (anvil-server--batch-emit-response
+       resp (not (eq anvil-runtime-shell--fast-dialect 'ndjson))))
     (anvil-server-stop)
     (setq anvil-runtime-shell--fast-pending-body nil))
-  (anvil-server-run-batch-stdio server-id))
+  ;; NeLisp v1.2.0: the reader has no process-exit primitive (Layer 2's
+  ;; `kill-emacs' returns without exiting), and `nelisp --load FILE'
+  ;; prints the value of FILE's last form to stdout on return -- a stray
+  ;; `t' behind the final MCP frame.  bin/anvil-runtime therefore starts
+  ;; the reader as bare `nelisp BOOTSTRAP', where the last form's value is
+  ;; the exit status instead, and ends the bootstrap with `0'.  Nothing to
+  ;; do here but return.
+  ;;
+  ;; `anvil-runtime prewarm' sets `anvil-runtime-bootstrap-prewarm': the
+  ;; module chain above has generated the schema cache, the module map
+  ;; and the fast-handshake file, which is all a prewarm is for, so
+  ;; return without serving.  A first-ever start of the DB-backed module
+  ;; set costs ~9 minutes of schema generation on the reader; this moves
+  ;; that out of the first MCP session.
+  (if (and (boundp 'anvil-runtime-bootstrap-prewarm)
+           anvil-runtime-bootstrap-prewarm)
+      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+        (nelisp--write-stderr-line
+         (format "[shell-loop] prewarm done: %d tools registered"
+                 (length (anvil-runtime-shell--registered-tool-ids)))))
+    (anvil-server-run-batch-stdio server-id)))
 
 ;;; anvil-runtime-shell-loop.el ends here
