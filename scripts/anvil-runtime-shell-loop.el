@@ -685,6 +685,13 @@ MODULES is the current `ANVIL_TOOL_MODULES' value the file must match."
               (anvil-runtime-shell--fast-log
                (concat "[FAST] method=" (or method "nil")))
               (cond
+               ;; Modern (2026-07-28) requests carry per-request metadata
+               ;; and need the full dual-era server; the cache only knows
+               ;; the legacy answer shape.
+               ((anvil-runtime-shell--substr-pos
+                 body "io.modelcontextprotocol/protocolVersion")
+                (setq anvil-runtime-shell--fast-pending-body body)
+                (setq keep-going nil))
                ((equal method "initialize")
                 (anvil-runtime-shell--stdout
                  (anvil-runtime-shell--frame

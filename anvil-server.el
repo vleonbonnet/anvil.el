@@ -128,6 +128,43 @@ tight non-yielding loop.  Nil (default) imposes no limit."
 (defconst anvil-server-protocol-version "2025-03-26"
   "Current MCP protocol version supported by this server.")
 
+(defconst anvil-server-modern-protocol-versions '("2026-07-28")
+  "Stateless MCP revisions served from per-request `_meta'.")
+
+(defconst anvil-server-unsupported-protocol-version-error -32022
+  "MCP 2026-07-28 UnsupportedProtocolVersion error code.")
+
+(defvar anvil-server--modern-request nil
+  "Protocol version of the modern request being served, or nil.
+Bound around dispatch so response builders add the modern result fields.")
+
+(defvar anvil-server--modern-result-extra nil
+  "Extra JSON members (a string such as \"\\\"ttlMs\\\":60000\") for the result.")
+
+(defun anvil-server--modern-result-prefix ()
+  "Return the JSON members every modern result starts with, plus a comma."
+  (concat "\"resultType\":\"complete\","
+          "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":"
+          (json-encode anvil-server-name)
+          ",\"version\":" (json-encode anvil-server-protocol-version) "}},"
+          (if anvil-server--modern-result-extra
+              (concat anvil-server--modern-result-extra ",")
+            "")))
+
+(defun anvil-server--modernize-result-json (result-json)
+  "Splice the modern result members into RESULT-JSON when serving modern.
+RESULT-JSON must be a JSON object string; it is returned unchanged for
+legacy requests and never mutated."
+  (if (and anvil-server--modern-request
+           (> (length result-json) 1)
+           (eq (aref result-json 0) ?{))
+      (let ((prefix (anvil-server--modern-result-prefix))
+            (rest (substring result-json 1)))
+        (if (eq (aref rest 0) ?})
+            (concat "{" (substring prefix 0 -1) rest)
+          (concat "{" prefix rest)))
+    result-json))
+
 ;;; Public API - JSON-RPC 2.0 Error Codes
 
 (defconst anvil-server-jsonrpc-error-parse -32700
@@ -481,7 +518,10 @@ in `tools/list' immediately.  The real module is loaded on first
               (nelisp--write-stderr-line
                (format "[JR] form-built %.4fs" (- (float-time) t0)))))
          (t1 (float-time))
-         (out (json-encode form)))
+         (out (if anvil-server--modern-request
+                  (anvil-server--jsonrpc-response-from-result-json
+                   id (if result (json-encode result) "{}"))
+                (json-encode form))))
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (format "[JR] json-encode %.4fs len=%d"
@@ -528,7 +568,7 @@ a full json-encode of the (potentially ~20KB) result object."
            ((stringp id) (json-encode id))
            (t (json-encode id)))
           ",\"result\":"
-          result-json
+          (anvil-server--modernize-result-json result-json)
           "}"))
 
 
@@ -969,8 +1009,46 @@ Returns a JSON-RPC formatted response string, or nil for notifications."
 
      ;; Process valid request
      (t
-      (anvil-server--dispatch-jsonrpc-method
-       id method params server-id)))))
+      (anvil-server--dispatch-by-era id method params server-id)))))
+
+(defun anvil-server--request-protocol-version (params)
+  "Return the modern protocol version declared in PARAMS' `_meta', or nil."
+  (let ((meta (and (listp params) (alist-get '_meta params))))
+    (and (listp meta)
+         (alist-get 'io.modelcontextprotocol/protocolVersion meta))))
+
+(defun anvil-server--dispatch-by-era (id method params server-id)
+  "Dispatch METHOD for SERVER-ID in the era its PARAMS declare.
+A request with modern `_meta' is served statelessly (MCP 2026-07-28);
+anything else keeps initialize-era behavior.  ID is the request id."
+  (let ((version (anvil-server--request-protocol-version params)))
+    (cond
+     ((null version)
+      (anvil-server--dispatch-jsonrpc-method id method params server-id))
+     ((not (member version anvil-server-modern-protocol-versions))
+      (if id
+          (json-encode
+           `((jsonrpc . "2.0")
+             (id . ,id)
+             (error
+              . ((code . ,anvil-server-unsupported-protocol-version-error)
+                 (message . "Unsupported protocol version")
+                 (data
+                  . ((supported
+                      . ,(vconcat anvil-server-modern-protocol-versions
+                                  (list anvil-server-protocol-version)))
+                     (requested . ,version)))))))
+        nil))
+     ((equal method "initialize")
+      ;; An initialize request selects legacy semantics even with _meta.
+      (anvil-server--dispatch-jsonrpc-method id method params server-id))
+     ((equal method "server/discover")
+      (let ((anvil-server--modern-request version))
+        (anvil-server--handle-discover id server-id)))
+     (t
+      (let ((anvil-server--modern-request version))
+        (anvil-server--dispatch-jsonrpc-method
+         id method params server-id))))))
 
 ;;; Resource Template Support
 
@@ -1194,6 +1272,44 @@ Returns a JSON-RPC response string for the request."
 
 ;;; Notification handlers
 
+(defun anvil-server--capabilities-json (server-id)
+  "Return the capabilities object JSON advertised for SERVER-ID."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         (tools-table (gethash resolved-id anvil-server--tools))
+         (resources-table (gethash resolved-id anvil-server--resources))
+         (templates-table
+          (gethash resolved-id anvil-server--resource-templates)))
+    (concat "{"
+            (mapconcat
+             #'identity
+             (delq nil
+                   (list
+                    (when (and tools-table
+                               (> (hash-table-count tools-table) 0))
+                      "\"tools\":{}")
+                    (when (or (and resources-table
+                                   (> (hash-table-count resources-table) 0))
+                              (and templates-table
+                                   (> (hash-table-count templates-table) 0)))
+                      "\"resources\":{}")))
+             ",")
+            "}")))
+
+(defun anvil-server--handle-discover (id server-id)
+  "Handle modern `server/discover' request ID for SERVER-ID.
+Advertise the supported protocol versions of both eras and the same
+capabilities `initialize' reports."
+  (anvil-server--jsonrpc-response-from-result-json
+   id
+   (concat "{\"supportedVersions\":["
+           (mapconcat #'json-encode
+                      (append anvil-server-modern-protocol-versions
+                              (list anvil-server-protocol-version))
+                      ",")
+           "],\"capabilities\":"
+           (anvil-server--capabilities-json server-id)
+           "}")))
+
 (defun anvil-server--handle-initialize (id server-id)
   "Handle initialize request with ID for SERVER-ID.
 This implements the MCP initialize handshake, which negotiates protocol
@@ -1359,7 +1475,10 @@ Perf (2026-05-11): the JSON-encoded `result' object is cached per
 server-id in `anvil-server--tools-list-cache' and skips full
 json-encode on subsequent calls.  The cache is invalidated by
 register / unregister."
-  (let* ((resolved-id (anvil-server--resolve-id server-id))
+  (let* ((anvil-server--modern-result-extra
+          (and anvil-server--modern-request
+               "\"ttlMs\":60000,\"cacheScope\":\"private\""))
+         (resolved-id (anvil-server--resolve-id server-id))
          ;; Filter function may have stateful side effects keyed off
          ;; the *virtual* server-id (= unresolved).  We still cache
          ;; by resolved-id because the maphash domain (= tools table)
