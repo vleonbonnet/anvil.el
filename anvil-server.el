@@ -120,6 +120,17 @@ tight non-yielding loop.  Nil (default) imposes no limit."
   :type '(choice (const :tag "No timeout" nil) number)
   :group 'anvil-server)
 
+(defcustom anvil-server-tool-error-max-chars 4096
+  "Maximum characters of tool error text sent to the client.
+Tool errors are read by LLM clients, and the client typically feeds
+the whole message back into the model's context.  The signal data of
+an unexpected error can carry arbitrarily large objects (a buffer's
+text, a populated hash table), so unbounded error text can exceed the
+model's context window on its own.  Longer messages are cut and end
+with a trailer stating the original length.  Nil disables the cap."
+  :type '(choice (const :tag "Unlimited" nil) integer)
+  :group 'anvil-server)
+
 ;;; Public Constants
 
 (defconst anvil-server-name "anvil"
@@ -804,7 +815,7 @@ schema extraction and argument binding while transport encoding happens
 after execution."
   (let* ((raw-handler
           (if-let* ((wrapped (and (symbolp handler)
-                                 (get handler 'anvil-server-raw-handler))))
+                                  (get handler 'anvil-server-raw-handler))))
               wrapped
             handler))
          (encode-result
@@ -820,9 +831,9 @@ If KEY already exists, increment its reference count.
 Otherwise, add ITEM to TABLE with :ref-count 1.
 Returns nil."
   (if-let* ((existing (gethash key table)))
-    ;; Item already exists - increment ref count
-    (let ((ref-count (or (plist-get existing :ref-count) 1)))
-      (plist-put existing :ref-count (1+ ref-count)))
+      ;; Item already exists - increment ref count
+      (let ((ref-count (or (plist-get existing :ref-count) 1)))
+        (plist-put existing :ref-count (1+ ref-count)))
     ;; New item - ensure it has ref-count = 1
     (plist-put item :ref-count 1)
     (puthash key item table))
@@ -835,14 +846,14 @@ Otherwise, remove the item from TABLE.
 Returns t if item was found, nil otherwise."
   (if-let* ((item (gethash key table))
             (ref-count (or (plist-get item :ref-count) 1)))
-    (if (> ref-count 1)
-        ;; Decrement ref count
-        (progn
-          (plist-put item :ref-count (1- ref-count))
-          t)
-      ;; Last reference - remove the item
-      (remhash key table)
-      t)))
+      (if (> ref-count 1)
+          ;; Decrement ref count
+          (progn
+            (plist-put item :ref-count (1- ref-count))
+            t)
+        ;; Last reference - remove the item
+        (remhash key table)
+        t)))
 
 (defun anvil-server--jsonrpc-error (id code message)
   "Create a JSON-RPC error response with ID, error CODE and MESSAGE."
@@ -1550,10 +1561,10 @@ IS-TEMPLATE indicates whether this is a template resource."
          (base-entry
           `((,uri-field . ,uri-or-template) (name . ,name))))
     (anvil-server--append-optional-fields base-entry
-                                            'description
-                                            description
-                                            'mimeType
-                                            mime-type)))
+                                          'description
+                                          description
+                                          'mimeType
+                                          mime-type)))
 
 (defun anvil-server--collect-resources-from-hash
     (hash-table is-template)
@@ -1798,7 +1809,10 @@ virtual server-ids share the same handler pool."
                     `((content
                        .
                        ,(vector
-                         `((type . "text") (text . ,(cadr err)))))
+                         `((type . "text")
+                           (text . ,(anvil-server-truncate-text
+                                     (cadr err)
+                                     anvil-server-tool-error-max-chars)))))
                       (isError . t))))
                (anvil-server--respond-with-result
                 context formatted-error)))
@@ -1816,8 +1830,12 @@ virtual server-ids share the same handler pool."
               err tool-name 'tool-body)
              (anvil-server--jsonrpc-error
               id anvil-server-jsonrpc-error-internal
-              (format "Internal error executing tool: %s"
-                      (error-message-string err))))))
+              (anvil-server-truncate-text
+               (format "Internal error executing tool: %s"
+                       (let ((print-length 64)
+                             (print-level 8))
+                         (error-message-string err)))
+               anvil-server-tool-error-max-chars)))))
       (anvil-server-metrics--track-tool-call tool-name t)
       (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
       (anvil-server--jsonrpc-error
@@ -1910,12 +1928,40 @@ Signals `anvil-server-tool-error' on timeout or remote error."
 
 ;;; Error handling helpers
 
+(defun anvil-server-truncate-text (text max-chars &optional hint)
+  "Return TEXT cut to at most MAX-CHARS characters plus a trailer.
+TEXT is returned unchanged when it is not a string, MAX-CHARS is nil,
+or TEXT fits.  The trailer states how much was kept out of the
+original length; HINT, when non-nil, is appended to it to tell the
+reader how to get a smaller result."
+  (if (or (not (stringp text))
+          (null max-chars)
+          (<= (length text) max-chars))
+      text
+    (concat (substring text 0 (max 0 max-chars))
+            (format "\n…[truncated: showing %d of %d chars%s]"
+                    (max 0 max-chars) (length text)
+                    (if hint (concat "; " hint) "")))))
+
+(defun anvil-server-format-tool-error (err)
+  "Return the \"Error: ...\" tool message for condition ERR.
+The signal data is printed with bounded `print-length' and
+`print-level' so a huge object carried by ERR is elided while it is
+printed rather than after, then the text is capped at
+`anvil-server-tool-error-max-chars'."
+  (anvil-server-truncate-text
+   (let ((print-length 64)
+         (print-level 8))
+     (format "Error: %S" err))
+   anvil-server-tool-error-max-chars))
+
 (defmacro anvil-server-with-error-handling (&rest body)
   "Execute BODY with automatic error handling for MCP tools.
 
 Any error that occurs during BODY execution is caught and converted to
 an MCP tool error using `anvil-server-tool-throw'.  This ensures
-consistent error reporting to LLM clients.
+consistent error reporting to LLM clients.  The message is bounded by
+`anvil-server-format-tool-error'.
 
 Arguments:
   BODY  Forms to execute with error handling
@@ -1941,7 +1987,7 @@ See also: `anvil-server-tool-throw'"
      (error
       (anvil-server--run-tool-error-hook
        err anvil-server--current-tool-name 'tool-body)
-      (anvil-server-tool-throw (format "Error: %S" err)))))
+      (anvil-server-tool-throw (anvil-server-format-tool-error err)))))
 
 ;;; Tool helpers
 
@@ -2208,7 +2254,7 @@ framing (e.g. missing Content-Length header)."
             (list :body body :consumed consumed)))))))))
 
 (define-error 'anvil-mcp-frame-error
-  "Malformed MCP Content-Length framing")
+              "Malformed MCP Content-Length framing")
 
 (defun anvil-server-mcp-detect-framing-p (initial)
   "Return non-nil if INITIAL bytes look like MCP Content-Length framing.
@@ -2365,11 +2411,11 @@ See also:
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line (concat "[REG-IN] " id)))
     (if-let* ((existing (gethash id tools-table)))
-      (if (plist-get existing :lazy-placeholder)
-          (progn
-            (remhash id tools-table)
-            (apply #'anvil-server-register-tool handler properties))
-        (anvil-server--ref-counted-register id existing tools-table))
+        (if (plist-get existing :lazy-placeholder)
+            (progn
+              (remhash id tools-table)
+              (apply #'anvil-server-register-tool handler properties))
+          (anvil-server--ref-counted-register id existing tools-table))
       (let* ((_p1 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-1 normalize] " id))))
              (handler-meta
@@ -2588,43 +2634,43 @@ Supports RFC 6570 simple variables {var} and reserved expansion {+var}."
     ;; Process template character by character
     (while (< pos len)
       (if-let* ((var-start (string-match "{" template pos)))
-        ;; Found variable start
-        (progn
-          ;; Add literal segment before variable if any
-          (when (> var-start pos)
-            (push (list
-                   :type 'literal
-                   :value (substring template pos var-start))
-                  segments))
-          ;; Find variable end (guaranteed to exist due to balance check)
-          (let* ((var-end (string-match "}" template var-start))
-                 ;; Extract variable content
-                 (var-content
-                  (substring template (1+ var-start) var-end))
-                 (reserved
-                  (and (> (length var-content) 0)
-                       (eq (aref var-content 0) ?+)))
-                 (var-name
-                  (if reserved
-                      (substring var-content 1)
-                    var-content)))
-            ;; Validate variable name
-            ;; RFC 6570: Variable names must start with ALPHA / "_"
-            ;; and contain only ALPHA / DIGIT / "_" / pct-encoded
-            (unless (string-match-p
-                     "\\`[A-Za-z_][A-Za-z0-9_]*\\'" var-name)
-              (error
-               "Invalid variable name '%s' in resource template: %s"
-               var-name
-               template))
-            ;; Add variable segment
-            (push (list
-                   :type 'variable
-                   :name var-name
-                   :reserved reserved)
-                  segments)
-            (push var-name variables)
-            (setq pos (1+ var-end))))
+          ;; Found variable start
+          (progn
+            ;; Add literal segment before variable if any
+            (when (> var-start pos)
+              (push (list
+                     :type 'literal
+                     :value (substring template pos var-start))
+                    segments))
+            ;; Find variable end (guaranteed to exist due to balance check)
+            (let* ((var-end (string-match "}" template var-start))
+                   ;; Extract variable content
+                   (var-content
+                    (substring template (1+ var-start) var-end))
+                   (reserved
+                    (and (> (length var-content) 0)
+                         (eq (aref var-content 0) ?+)))
+                   (var-name
+                    (if reserved
+                        (substring var-content 1)
+                      var-content)))
+              ;; Validate variable name
+              ;; RFC 6570: Variable names must start with ALPHA / "_"
+              ;; and contain only ALPHA / DIGIT / "_" / pct-encoded
+              (unless (string-match-p
+                       "\\`[A-Za-z_][A-Za-z0-9_]*\\'" var-name)
+                (error
+                 "Invalid variable name '%s' in resource template: %s"
+                 var-name
+                 template))
+              ;; Add variable segment
+              (push (list
+                     :type 'variable
+                     :name var-name
+                     :reserved reserved)
+                    segments)
+              (push var-name variables)
+              (setq pos (1+ var-end))))
         ;; No more variables, add remaining literal
         (when (< pos len)
           (push (list :type 'literal :value (substring template pos))
@@ -2655,7 +2701,7 @@ EXTRA-PROPS is a plist of additional properties to include (e.g., :parsed)."
       (error "Resource registration requires :name property"))
 
     (if-let* ((existing (gethash uri hash-table)))
-      (anvil-server--ref-counted-register uri existing hash-table)
+        (anvil-server--ref-counted-register uri existing hash-table)
       (let ((entry
              (append (list :handler handler :name name) extra-props)))
         (when description
