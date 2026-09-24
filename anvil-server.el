@@ -815,7 +815,7 @@ schema extraction and argument binding while transport encoding happens
 after execution."
   (let* ((raw-handler
           (if-let* ((wrapped (and (symbolp handler)
-                                  (get handler 'anvil-server-raw-handler))))
+                                 (get handler 'anvil-server-raw-handler))))
               wrapped
             handler))
          (encode-result
@@ -831,9 +831,9 @@ If KEY already exists, increment its reference count.
 Otherwise, add ITEM to TABLE with :ref-count 1.
 Returns nil."
   (if-let* ((existing (gethash key table)))
-      ;; Item already exists - increment ref count
-      (let ((ref-count (or (plist-get existing :ref-count) 1)))
-        (plist-put existing :ref-count (1+ ref-count)))
+    ;; Item already exists - increment ref count
+    (let ((ref-count (or (plist-get existing :ref-count) 1)))
+      (plist-put existing :ref-count (1+ ref-count)))
     ;; New item - ensure it has ref-count = 1
     (plist-put item :ref-count 1)
     (puthash key item table))
@@ -846,14 +846,14 @@ Otherwise, remove the item from TABLE.
 Returns t if item was found, nil otherwise."
   (if-let* ((item (gethash key table))
             (ref-count (or (plist-get item :ref-count) 1)))
-      (if (> ref-count 1)
-          ;; Decrement ref count
-          (progn
-            (plist-put item :ref-count (1- ref-count))
-            t)
-        ;; Last reference - remove the item
-        (remhash key table)
-        t)))
+    (if (> ref-count 1)
+        ;; Decrement ref count
+        (progn
+          (plist-put item :ref-count (1- ref-count))
+          t)
+      ;; Last reference - remove the item
+      (remhash key table)
+      t)))
 
 (defun anvil-server--jsonrpc-error (id code message)
   "Create a JSON-RPC error response with ID, error CODE and MESSAGE."
@@ -1561,10 +1561,10 @@ IS-TEMPLATE indicates whether this is a template resource."
          (base-entry
           `((,uri-field . ,uri-or-template) (name . ,name))))
     (anvil-server--append-optional-fields base-entry
-                                          'description
-                                          description
-                                          'mimeType
-                                          mime-type)))
+                                            'description
+                                            description
+                                            'mimeType
+                                            mime-type)))
 
 (defun anvil-server--collect-resources-from-hash
     (hash-table is-template)
@@ -2254,7 +2254,7 @@ framing (e.g. missing Content-Length header)."
             (list :body body :consumed consumed)))))))))
 
 (define-error 'anvil-mcp-frame-error
-              "Malformed MCP Content-Length framing")
+  "Malformed MCP Content-Length framing")
 
 (defun anvil-server-mcp-detect-framing-p (initial)
   "Return non-nil if INITIAL bytes look like MCP Content-Length framing.
@@ -2411,11 +2411,11 @@ See also:
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line (concat "[REG-IN] " id)))
     (if-let* ((existing (gethash id tools-table)))
-        (if (plist-get existing :lazy-placeholder)
-            (progn
-              (remhash id tools-table)
-              (apply #'anvil-server-register-tool handler properties))
-          (anvil-server--ref-counted-register id existing tools-table))
+      (if (plist-get existing :lazy-placeholder)
+          (progn
+            (remhash id tools-table)
+            (apply #'anvil-server-register-tool handler properties))
+        (anvil-server--ref-counted-register id existing tools-table))
       (let* ((_p1 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-1 normalize] " id))))
              (handler-meta
@@ -2634,43 +2634,43 @@ Supports RFC 6570 simple variables {var} and reserved expansion {+var}."
     ;; Process template character by character
     (while (< pos len)
       (if-let* ((var-start (string-match "{" template pos)))
-          ;; Found variable start
-          (progn
-            ;; Add literal segment before variable if any
-            (when (> var-start pos)
-              (push (list
-                     :type 'literal
-                     :value (substring template pos var-start))
-                    segments))
-            ;; Find variable end (guaranteed to exist due to balance check)
-            (let* ((var-end (string-match "}" template var-start))
-                   ;; Extract variable content
-                   (var-content
-                    (substring template (1+ var-start) var-end))
-                   (reserved
-                    (and (> (length var-content) 0)
-                         (eq (aref var-content 0) ?+)))
-                   (var-name
-                    (if reserved
-                        (substring var-content 1)
-                      var-content)))
-              ;; Validate variable name
-              ;; RFC 6570: Variable names must start with ALPHA / "_"
-              ;; and contain only ALPHA / DIGIT / "_" / pct-encoded
-              (unless (string-match-p
-                       "\\`[A-Za-z_][A-Za-z0-9_]*\\'" var-name)
-                (error
-                 "Invalid variable name '%s' in resource template: %s"
-                 var-name
-                 template))
-              ;; Add variable segment
-              (push (list
-                     :type 'variable
-                     :name var-name
-                     :reserved reserved)
-                    segments)
-              (push var-name variables)
-              (setq pos (1+ var-end))))
+        ;; Found variable start
+        (progn
+          ;; Add literal segment before variable if any
+          (when (> var-start pos)
+            (push (list
+                   :type 'literal
+                   :value (substring template pos var-start))
+                  segments))
+          ;; Find variable end (guaranteed to exist due to balance check)
+          (let* ((var-end (string-match "}" template var-start))
+                 ;; Extract variable content
+                 (var-content
+                  (substring template (1+ var-start) var-end))
+                 (reserved
+                  (and (> (length var-content) 0)
+                       (eq (aref var-content 0) ?+)))
+                 (var-name
+                  (if reserved
+                      (substring var-content 1)
+                    var-content)))
+            ;; Validate variable name
+            ;; RFC 6570: Variable names must start with ALPHA / "_"
+            ;; and contain only ALPHA / DIGIT / "_" / pct-encoded
+            (unless (string-match-p
+                     "\\`[A-Za-z_][A-Za-z0-9_]*\\'" var-name)
+              (error
+               "Invalid variable name '%s' in resource template: %s"
+               var-name
+               template))
+            ;; Add variable segment
+            (push (list
+                   :type 'variable
+                   :name var-name
+                   :reserved reserved)
+                  segments)
+            (push var-name variables)
+            (setq pos (1+ var-end))))
         ;; No more variables, add remaining literal
         (when (< pos len)
           (push (list :type 'literal :value (substring template pos))
@@ -2701,7 +2701,7 @@ EXTRA-PROPS is a plist of additional properties to include (e.g., :parsed)."
       (error "Resource registration requires :name property"))
 
     (if-let* ((existing (gethash uri hash-table)))
-        (anvil-server--ref-counted-register uri existing hash-table)
+      (anvil-server--ref-counted-register uri existing hash-table)
       (let ((entry
              (append (list :handler handler :name name) extra-props)))
         (when description
