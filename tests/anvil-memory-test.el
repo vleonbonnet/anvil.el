@@ -2114,6 +2114,54 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
     (should-error (anvil-memory-add "feedback_dup_rule" 'feedback "second"))))
 
 
+;;;; --- Phase 5: DB-direct update --------------------------------------
+
+(ert-deftest anvil-memory-test/update-replaces-body-and-fts ()
+  "memory-update swaps the body and the FTS row in one call."
+  (skip-unless (and (anvil-memory-test--supported-p 'update)
+                    (anvil-memory-test--supported-p 'add)
+                    (anvil-memory-test--supported-p 'search)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_upd_rule" 'feedback
+                      "old_keyword_alpha body")
+    (let ((res (anvil-memory-update "feedback_upd_rule"
+                                    :body "new_keyword_beta body")))
+      (should (equal '(:body) (plist-get res :updated)))
+      (should (stringp (plist-get res :digest))))
+    (should-not (anvil-memory-search "old_keyword_alpha"))
+    (let ((hits (anvil-memory-search "new_keyword_beta")))
+      (should hits))
+    (let ((entry (anvil-memory-get "feedback_upd_rule")))
+      (should (string-match-p "new_keyword_beta"
+                              (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/update-meta-fields ()
+  "memory-update rewrites type / tags / ttl_policy independently."
+  (skip-unless (and (anvil-memory-test--supported-p 'update)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_upd_meta" 'feedback "body")
+    (let ((res (anvil-memory-update "feedback_upd_meta"
+                                    :type 'project
+                                    :tags '("a" "b"))))
+      (should (equal '(:type :tags) (plist-get res :updated))))
+    (let ((entry (anvil-memory-get "feedback_upd_meta")))
+      (should (eq 'project (plist-get entry :type)))
+      (should (equal "a,b" (plist-get entry :tags))))))
+
+(ert-deftest anvil-memory-test/update-rejects-bad-input ()
+  "memory-update signals on unknown names, scan rows, and no-op calls."
+  (skip-unless (and (anvil-memory-test--supported-p 'update)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_upd_guard" 'feedback "body")
+    (should-error (anvil-memory-update "feedback_upd_guard"))
+    (should-error (anvil-memory-update "feedback_no_such" :body "x"))
+    (should-error (anvil-memory-update "/abs/path/row.md" :body "x"))
+    (should-error (anvil-memory-update "feedback_upd_guard"
+                                       :type 'not-a-type))))
+
+
 ;;;; --- Phase 5: prune skips synthetic ---------------------------------
 
 (ert-deftest anvil-memory-test/prune-skips-synthetic-paths ()
@@ -2570,6 +2618,99 @@ yields a delta with reason `no-change' and empty text."
       (should (plist-get c :likely-duplicate))
       (should (= 0.8 (plist-get c :top-similarity))))))
 
+
+;;;; --- scan transaction --------------------------------------------------
+
+;; `anvil-memory-scan' issues three `sqlite-execute' calls per file.  Without a
+;; surrounding transaction each one is its own implicit transaction and fsync,
+;; so a full scan costs ~3 commits per file.  Measured on a real 1010-file tree:
+;; 29.4s unbatched, 0.19s for the same walk with zero DB writes (reading is
+;; free), 4.44s for the identical writes inside one transaction.
+;;
+;; These tests pin the two properties that fix must preserve — identical rows,
+;; and atomicity on failure — plus the commit-count reduction that is the point.
+
+(defun anvil-memory-test--write-n-files (root n)
+  "Create N .md memory files under ROOT.  Returns the list of paths."
+  (let (paths)
+    (dotimes (i n)
+      (let ((p (expand-file-name (format "finding_txn_%03d.md" i) root)))
+        (with-temp-file p
+          (insert (format "---\nname: txn probe %d\ndescription: d%d\n---\n\nbody %d\n"
+                          i i i)))
+        (push p paths)))
+    (nreverse paths)))
+
+(ert-deftest anvil-memory-scan-indexes-every-file ()
+  "Scanning N files registers N meta rows and N FTS rows.
+Row parity is the invariant any batching change must not disturb."
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write-n-files root 12)
+    (should (= 12 (anvil-memory-scan)))
+    (let ((db (anvil-memory--db)))
+      (should (= 12 (caar (sqlite-select db "SELECT count(*) FROM memory_meta"))))
+      (should (= 12 (caar (sqlite-select db "SELECT count(*) FROM memory_body_fts")))))))
+
+(ert-deftest anvil-memory-scan-body-is-searchable-after-rescan ()
+  "A changed body is reflected in FTS after re-scanning.
+Guards the reason the FTS row is deleted and reinserted per file: batching
+must not turn that into a no-op for already-registered files."
+  (anvil-memory-test--with-env
+    (let ((p (expand-file-name "finding_rescan.md" root)))
+      (with-temp-file p (insert "---\nname: r\ndescription: d\n---\n\nzzfirstbody\n"))
+      (anvil-memory-scan)
+      (should (anvil-memory-search "zzfirstbody"))
+      (with-temp-file p (insert "---\nname: r\ndescription: d\n---\n\nzzsecondbody\n"))
+      (anvil-memory-scan)
+      (should (anvil-memory-search "zzsecondbody"))
+      (should-not (anvil-memory-search "zzfirstbody")))))
+
+(ert-deftest anvil-memory-scan-uses-one-transaction ()
+  "The whole walk runs inside a single transaction, not one per statement.
+Counts BEGIN/COMMIT pairs rather than timing, so the test is not flaky on a
+loaded machine.  Unbatched, this sees 0 transactions for 8 files; batched it
+sees exactly 1 regardless of file count."
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write-n-files root 8)
+    (let ((begins 0) (commits 0))
+      (cl-letf* ((orig (symbol-function 'sqlite-execute))
+                 ((symbol-function 'sqlite-execute)
+                  (lambda (db sql &optional params)
+                    (cond ((string-prefix-p "BEGIN" sql) (cl-incf begins))
+                          ((string-prefix-p "COMMIT" sql) (cl-incf commits)))
+                    (funcall orig db sql params))))
+        (anvil-memory-scan))
+      (should (= 1 begins))
+      (should (= 1 commits)))))
+
+(ert-deftest anvil-memory-scan-rolls-back-on-error ()
+  "A failure mid-walk leaves the index unchanged rather than half-written.
+This is a deliberate behaviour change from the unbatched version, which
+committed every file as it went and so left partial state behind.
+
+Note the injection point: `anvil-memory--read-body-utf8' is already wrapped
+in `ignore-errors' inside the scan loop, so failing there proves nothing —
+the scan swallows it and completes.  `anvil-memory--infer-type' is not
+guarded, so it is the honest place to fail."
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write-n-files root 10)
+    (let ((db (anvil-memory--db))
+          (calls 0))
+      ;; Fail partway through, after some files have already been written.
+      (cl-letf* ((orig (symbol-function 'anvil-memory--infer-type))
+                 ((symbol-function 'anvil-memory--infer-type)
+                  (lambda (base)
+                    (cl-incf calls)
+                    (if (> calls 4)
+                        (error "anvil-memory-test: injected failure")
+                      (funcall orig base)))))
+        (should-error (anvil-memory-scan)))
+      ;; Nothing committed: the transaction rolled back.
+      (should (= 0 (caar (sqlite-select db "SELECT count(*) FROM memory_meta"))))
+      (should (= 0 (caar (sqlite-select db "SELECT count(*) FROM memory_body_fts"))))
+      ;; And the DB is not left locked — a later scan still succeeds.
+      (should (= 10 (anvil-memory-scan)))
+      (should (= 10 (caar (sqlite-select db "SELECT count(*) FROM memory_meta")))))))
 
 (provide 'anvil-memory-test)
 

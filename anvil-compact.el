@@ -133,6 +133,21 @@ self-contained."
   :type 'boolean
   :group 'anvil-compact)
 
+(defcustom anvil-compact-pressure-high-percent 75
+  "Context-usage percent treated as high pressure.
+With the default 200K context window this is roughly 150K tokens,
+matching the point where long Claude Code sessions become notably
+more expensive even with cached context."
+  :type 'integer
+  :group 'anvil-compact)
+
+(defcustom anvil-compact-pressure-long-session-hours 8
+  "Session age in hours treated as long-running pressure.
+The pressure report uses this to recommend `/compact' plus a
+fresh session boundary when a session has been active too long."
+  :type 'number
+  :group 'anvil-compact)
+
 (defconst anvil-compact--server-id "emacs-eval"
   "Server ID for the compact-* MCP tools.")
 
@@ -314,6 +329,85 @@ decision and log REASON for observability."
           :percent pct)))
 
 
+;;;; --- pressure report -----------------------------------------------------
+
+(defun anvil-compact--number-or-nil (value)
+  "Return VALUE as a number when it is numeric or a non-empty string."
+  (cond
+   ((numberp value) value)
+   ((and (stringp value) (not (string-empty-p value)))
+    (string-to-number value))
+   (t nil)))
+
+(defun anvil-compact--severity-rank (severity)
+  "Return an integer rank for SEVERITY."
+  (pcase severity
+    (:critical 3)
+    (:high 2)
+    (:medium 1)
+    (_ 0)))
+
+(defun anvil-compact--max-severity (a b)
+  "Return the stronger of severity symbols A and B."
+  (if (>= (anvil-compact--severity-rank a)
+          (anvil-compact--severity-rank b))
+      a
+    b))
+
+(cl-defun anvil-compact-pressure-report (&key transcript-path
+                                              session-start-ts
+                                              session-age-hours
+                                              task-in-progress
+                                              last-compact-percent)
+  "Return a token-cost pressure report for the current Claude session.
+TRANSCRIPT-PATH is estimated with `anvil-compact-estimate'.
+SESSION-START-TS is a seconds-since-epoch timestamp; alternatively
+SESSION-AGE-HOURS can be supplied directly.  TASK-IN-PROGRESS and
+LAST-COMPACT-PERCENT are forwarded to
+`anvil-compact-should-trigger'.
+
+Returns a plist with:
+  :severity            `:ok', `:medium', `:high', or `:critical'
+  :estimate            context estimate plist
+  :compact-decision    output from `anvil-compact-should-trigger'
+  :session-age-hours   numeric age or nil
+  :actions             ordered action strings
+  :audited-at          ISO timestamp."
+  (let* ((est (anvil-compact-estimate :transcript-path transcript-path))
+         (pct (plist-get est :percent))
+         (age (or (anvil-compact--number-or-nil session-age-hours)
+                  (let ((start (anvil-compact--number-or-nil
+                                session-start-ts)))
+                    (when start
+                      (/ (- (float-time) start) 3600.0)))))
+         (dec (anvil-compact-should-trigger
+               :percent pct
+               :task-in-progress task-in-progress
+               :last-compact-percent last-compact-percent))
+         (severity :ok)
+         actions)
+    (when (>= pct anvil-compact-trigger-percent)
+      (setq severity (anvil-compact--max-severity severity :medium))
+      (push "Run /compact at the next clean task boundary." actions))
+    (when (>= pct anvil-compact-pressure-high-percent)
+      (setq severity (anvil-compact--max-severity severity :critical))
+      (push "Context is above the high-pressure threshold; compact before more file reads or MCP calls." actions))
+    (when (and age (>= age anvil-compact-pressure-long-session-hours))
+      (setq severity (anvil-compact--max-severity severity :high))
+      (push "Session has been active for 8+ hours; compact, checkpoint, then start a fresh task/session if work scope changed." actions))
+    (when (plist-get dec :trigger)
+      (push "Auto-compact trigger is eligible now." actions))
+    (when (and (eq (plist-get dec :reason) :in-progress)
+               (>= pct anvil-compact-trigger-percent))
+      (push "Finish or checkpoint the in-progress task before compacting." actions))
+    (list :severity severity
+          :estimate est
+          :compact-decision dec
+          :session-age-hours age
+          :actions (nreverse actions)
+          :audited-at (format-time-string "%Y-%m-%dT%H:%M:%S%z"))))
+
+
 ;;;; --- snapshot ------------------------------------------------------------
 
 (defun anvil-compact--collect-events (session-id explicit)
@@ -380,13 +474,57 @@ Returns the stored snapshot plist."
   "Fetch the latest snapshot plist for SESSION-ID, or nil."
   (anvil-compact--state-get session-id "snapshot"))
 
-(defun anvil-compact-snapshot-format (snap)
+(defcustom anvil-compact-append-session-ref nil
+  "When non-nil, append a Doc 63 reference snapshot to the preamble.
+
+The reference snapshot (`anvil-session-store-snapshot-ref') is a
+table of contents over the indexed event log: it names the event
+categories, lists recent identifiers, and embeds a runnable search
+call so the model can pull full rows on demand.  It complements the
+count-capped digest above rather than replacing it.
+
+Default nil — Doc 17 Phase 4 made hook behaviour explicit opt-in,
+and this inherits that stance.  Turning it on is only useful once
+the capture hook is installed; without it the event log has nothing
+structured to summarise."
+  :type 'boolean
+  :group 'anvil-compact)
+
+;; anvil-session-store is loaded on demand below, not required at the
+;; top of this file: anvil-compact must keep working on a build where
+;; the Doc 63 store is absent or has no SQLite behind it.
+(declare-function anvil-session-store-snapshot-ref "anvil-session-store"
+                  (session-id &rest keys))
+(declare-function anvil-session-store-available-p "anvil-session-store" ())
+
+(defun anvil-compact--session-ref (session-id)
+  "Return the Doc 63 reference snapshot for SESSION-ID, or nil.
+
+Returns nil — never signals — when the feature is off, the store
+module is absent, or this runtime has no SQLite.  A restore
+preamble that fails to render is worse than one without the extra
+section, because it is emitted on the path where the model has
+just lost its history."
+  (when (and anvil-compact-append-session-ref
+             (stringp session-id) (not (string-empty-p session-id)))
+    (condition-case nil
+        (when (and (require 'anvil-session-store nil t)
+                   (fboundp 'anvil-session-store-available-p)
+                   (anvil-session-store-available-p))
+          (let ((ref (anvil-session-store-snapshot-ref session-id)))
+            (and (stringp ref) (not (string-empty-p ref)) ref)))
+      (error nil))))
+
+(defun anvil-compact-snapshot-format (snap &optional session-id)
   "Render SNAP as a human-readable continuation string.
 The returned string is designed to be pasted into the model's
 context directly — it reads as an `[anvil-compact restore]'
 preamble that the model can use to pick up where /compact left
 off.  Missing / empty fields are skipped rather than rendered as
-blank labels."
+blank labels.
+
+With SESSION-ID and `anvil-compact-append-session-ref' non-nil, a
+Doc 63 reference snapshot for that session is appended."
   (when (and snap (listp snap))
     (let* ((ts     (plist-get snap :captured-at))
            (pct    (plist-get snap :percent))
@@ -424,6 +562,8 @@ blank labels."
                             (or kind "?")
                             (or summary ""))
                     parts)))))
+      (let ((ref (anvil-compact--session-ref session-id)))
+        (when ref (push ref parts)))
       (mapconcat #'identity (nreverse parts) "\n"))))
 
 
@@ -572,7 +712,7 @@ Priority (highest first):
      (flag
       (anvil-compact--state-clear-flag session-id)
       (let* ((snap (anvil-compact-snapshot-get session-id))
-             (preamble (or (anvil-compact-snapshot-format snap)
+             (preamble (or (anvil-compact-snapshot-format snap session-id)
                            "[anvil-compact restore]"))
              (pct (if (listp snap) (or (plist-get snap :percent) 0) 0))
              (body
@@ -595,7 +735,7 @@ Priority (highest first):
       (let ((queued (anvil-compact--queue-pop session-id)))
         (if (not queued)
             ""
-          (let ((preamble (or (anvil-compact-snapshot-format queued)
+          (let ((preamble (or (anvil-compact-snapshot-format queued session-id)
                               "[anvil-compact restore]")))
             (if (string-empty-p preamble)
                 ""
@@ -615,7 +755,7 @@ present.  Returns JSON additionalContext or an empty string."
          (snap   (or queued (anvil-compact-snapshot-get session-id))))
     (if (not snap)
         ""
-      (let ((preamble (anvil-compact-snapshot-format snap)))
+      (let ((preamble (anvil-compact-snapshot-format snap session-id)))
         (if (or (null preamble) (string-empty-p preamble))
             ""
           (anvil-compact--log-event
@@ -807,7 +947,7 @@ MCP Parameters:
   session_id - Claude Code session identifier"
   (anvil-server-with-error-handling
     (or (anvil-compact-snapshot-format
-         (anvil-compact-snapshot-get session_id))
+         (anvil-compact-snapshot-get session_id) session_id)
         "")))
 
 (defun anvil-compact--tool-stats (session_id since_ts)
@@ -830,6 +970,32 @@ MCP Parameters:
                    (let ((n (string-to-number since_ts)))
                      (when (> n 0) n))))))
       (anvil-compact-stats :session-id sid :since-ts since))))
+
+(defun anvil-compact--tool-pressure-report
+    (transcript_path session_start_ts session_age_hours
+                     task_in_progress last_compact_percent)
+  "Return a token-cost pressure report for a Claude Code session.
+
+MCP Parameters:
+  transcript_path       - absolute path to the JSONL transcript.
+                          Empty string returns zero context usage.
+  session_start_ts      - optional seconds-since-epoch session start.
+                          Empty string means unknown.
+  session_age_hours     - optional explicit age in hours.  When set,
+                          this wins over session_start_ts.
+  task_in_progress      - optional count of active tasks.
+  last_compact_percent  - optional last compact percent for cooldown."
+  (anvil-server-with-error-handling
+    (let ((path (and (stringp transcript_path)
+                     (not (string-empty-p transcript_path))
+                     transcript_path)))
+      (anvil-compact-pressure-report
+       :transcript-path path
+       :session-start-ts session_start_ts
+       :session-age-hours session_age_hours
+       :task-in-progress (anvil-compact--number-or-nil task_in_progress)
+       :last-compact-percent
+       (anvil-compact--number-or-nil last_compact_percent)))))
 
 (defun anvil-compact--tool-hook (session_id stage transcript_path)
   "Unified hook entry: dispatch STAGE for SESSION_ID.
@@ -934,6 +1100,19 @@ a metrics plist with per-kind counts, skipped-reason breakdown,
 trigger-percent distribution, compliance (restores / nudges), and
 the most recent trigger.  Use to validate the 45% threshold and
 nudge-obedience assumptions before tuning."
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-compact--tool-pressure-report
+   :id "compact-pressure-report"
+   :intent '(session compact observe)
+   :layer 'core
+   :server-id anvil-compact--server-id
+   :description
+   "Return a read-only pressure report combining transcript context
+estimate, auto-compact eligibility, high-context threshold (~150K
+tokens by default), and long-session age warnings.  Use before
+heavy MCP/file reads or when copied Claude limits point to
+>150K-context / 8h-session pressure."
    :read-only t))
 
 ;;;###autoload
@@ -950,6 +1129,8 @@ nudge-obedience assumptions before tuning."
   (anvil-server-unregister-tool "compact-hook"
                                 anvil-compact--server-id)
   (anvil-server-unregister-tool "compact-stats"
+                                anvil-compact--server-id)
+  (anvil-server-unregister-tool "compact-pressure-report"
                                 anvil-compact--server-id))
 
 (provide 'anvil-compact)

@@ -22,6 +22,8 @@
 ;; routes by content type, emits a compact view, and stores the original
 ;; under `anvil-state' so the caller can retrieve it on demand.
 
+;;; anvil-audit: tools-wrapped-at-registration
+
 ;;; Code:
 
 (require 'cl-lib)

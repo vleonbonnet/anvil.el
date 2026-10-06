@@ -78,6 +78,33 @@ Anvil の背景 - 何故開発するに至ったのか — [[file:STORY.ja.org][
 
 * 現在のリリースハイライト
 
+v1.4.1 (2026-10-04) adds bounded handling for
+selected file reads and successful inline results, bounded diagnostic and
+telemetry traversal, and safer worker cleanup after successful termination.
+The byte limits apply at their documented boundaries; they do not bound
+arbitrary execution or complete transport frames. The v1.4.0 feature baseline
+and July master wave remain available below.
+
+| Area | What changed |
+|------+--------------|
+| File reads | Default 1 MiB cap on selected raw bytes; pagination reads bounded chunks. Nil or non-positive legacy settings retain prior behavior. |
+| Inline results | Default 2 MiB budget for projected escaped UTF-8 JSON-string bytes on normalized successful results, checked before and after disclosure. Execution, result construction, error paths, and full frames are outside this limit. |
+| Diagnostics and telemetry | Finite traversal, depth, and leaf budgets apply before formatting. Raw tool-error snapshots are shared with telemetry; ordinary codes and metrics are preserved. Other error and transport paths are not all bounded. |
+| Worker cleanup | After a successful kill request, all identically owned slots are detached synchronously, without waiting for the sentinel. Kill errors preserve ownership; raw-response and pool diagnostics are retained. |
+
+For larger file reads, pass =offset="0"= and =limit="200"=, reducing the limit
+if the selected page is too large. Use paginated, filtered, tee, or asynchronous
+interfaces for larger results. Set =anvil-file-max-inline-read-bytes= or
+=anvil-server-max-inline-result-bytes= to nil or a non-positive integer only
+to restore the corresponding legacy behavior; other error and transport paths
+are not all bounded.
+
+Previous release: v1.4.0 (2026-10-03) brought the develop line to =master= with indexed
+Claude Code session recall, NeLisp v1.2.0 standalone runtime support,
+stateless MCP requests, bounded worker execution, memory updates, and
+new fusion, Wanderlust, and CAD capabilities. Details: [[file:CHANGELOG.md][CHANGELOG.md]]
+(English).
+
 2026-07 wave (post-v1.3.0、master 反映済み) は「検証接地 fusion スタック」と
 「実測ベースの省トークン層」を追加します。使い方ガイド:
 [[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]] (英語)。
@@ -200,7 +227,7 @@ Anvil の default install は *約 40 個の MCP ツール* を提供します (
 
 | 機能 | 何ができるか |
 |------|--------------|
-| =bin/anvil mcp serve --no-emacs= (v1.0) | *Emacs 不要のスタンドアロン経路。*  =anvil-runtime= Rust binary が Elisp を読み + 評価し、MCP stdio で anvil tool を提供。既存 Emacs ユーザーは =bin/anvil mcp serve= のまま変わらず |
+| =bin/anvil-runtime mcp serve= (v1.0+) | *Standalone path; no Emacs install required.* The NeLisp v1.2.0 reader evaluates Elisp and serves selected MCP tools. SQLite-backed tools require the dynamic reader and their modules to be enabled. |
 | =anvil-pkg= (v1.0) | Nix store を裏に持つ Elisp DSL package manager。=(pkg-install "ripgrep")= で nixpkgs 属性を直接、=(pkg-define …)= マクロで自前 build (=stdenv= / =rust= / =python= / =go= / =emacs-package= 各 build system 対応)。Guix の Scheme と同じ発想を Elisp で、anvil の MCP surface に統合 ── AI agent が依存を Lisp フォーム 1 行で install できる。リポジトリは [[https://github.com/zawatton/anvil-pkg][zawatton/anvil-pkg]] |
 | =anvil-ide.el= split (v1.0) | Emacs 専用の IDE 層 (treesit ナビゲーション、=worker-ui= dashboard、=info-lookup-symbol=) を [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]] に分離。元の機能セットが欲しいなら両方 install、人間用 IDE surface 不要で AI 側 workbench だけ欲しい場合は =anvil.el= のみで OK |
 | Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G ── =anvil-ts= / =-js= / =-py= の構造編集が、Emacs tree-sitter の無いホスト (NeLisp standalone 等) でも Python =ast= / acorn の subprocess fallback で稼働。Rust substrate でもトークン効率の良い AST query が維持される |
@@ -322,28 +349,15 @@ org ファイルに対してタイムアウトします。Anvil の org ツー�
 モノリシックな =init.org= やジャーナルファイル）でも見出し検索・アウトライン読み出しが
 高速に保たれます。
 
-** スタンドアロン runtime — Emacs daemon 起動コストが消える (v1.0)
+** Standalone runtime — selected tools without an Emacs daemon (v1.4.0)
 
-NeLisp Doc 44 の =bin/anvil mcp serve --no-emacs= は、Emacs daemon
-ではなく =anvil-runtime= Rust binary を起動します。short-lived な
-MCP セッション (CI 実行、one-shot エージェント dispatch、ephemeral
-container) では、Emacs daemon の cold-start を完全に飛ばし、フル
-装備 Emacs daemon に比べて常駐プロセスがずっと小さく収まります。
-
-Architecture α (=anvil-http= / =anvil-state= / =anvil-defs= /
-=anvil-org-index= が =fboundp= ガード + フォールバックで NeLisp に
-core helper を委譲) により、同じ MCP ツール surface が両基盤から
-到達可能です:
-
-| デプロイ形態      | ツール surface                                  |
-|-------------------+--------------------------------------------------|
-| Emacs 同梱        | =anvil.el= フル + =anvil-ide.el=                |
-| Rust のみ         | =anvil.el= フル (IDE は subprocess fallback)    |
-
-既存 Emacs ユーザーは =bin/anvil mcp serve= をそのまま継続。
-Container / ephemeral runner / 「Emacs を学ばずに AI workbench
-だけ欲しい」ユーザーは、=apt install emacs= 不要で同じ MCP ツール
-surface を Rust 経路から得られます。
+=bin/anvil-runtime mcp serve= uses the NeLisp reader without starting an
+Emacs daemon. Its tool surface depends on enabled modules and matching
+NeLisp / =nelisp-emacs-lib= revisions; SQLite-backed modules require the
+dynamic reader. Follow [[file:README.org][README.org]] Path A for =doctor= and =prewarm=,
+then inspect =tools/list= for available tools. Full Emacs and IDE coverage
+is not implied by standalone support. Existing Emacs users can continue
+using =bin/anvil mcp serve=.
 
 ** ケーススタディ: 大規模 TypeScript リファクタリング
 
@@ -573,9 +587,9 @@ Anvil を使うと:
 インストール方法は 2 系統あります。特別な理由がなければ *安定版*
 を選んでください。
 
-** 安定版 (推奨) — タグ =v1.3.0=
+** 安定版 (推奨) — タグ =v1.4.1=
 
-=v1.3.0= は現在の安定版タグです。新機能や修正は =master= に随時
+=v1.4.1= は現在の安定版タグです。新機能や修正は =master= に随時
 取り込まれており、表面が落ち着いたタイミングで適宜タグを切ります。
 =master= を追う理由が無ければ、このタグに固定して使ってください。
 
@@ -586,7 +600,7 @@ Anvil を使うと:
 
 #+begin_src emacs-lisp
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                            :tag "v1.3.0"
+                            :tag "v1.4.1"
                             :main "anvil.el")
 #+end_src
 
@@ -595,14 +609,14 @@ Anvil を使うと:
 #+begin_src emacs-lisp
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v1.3.0"))
+         :branch "v1.4.1"))
 #+end_src
 
 *** elpaca
 
 #+begin_src emacs-lisp
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v1.3.0"))
+               :ref "v1.4.1"))
 #+end_src
 
 *** use-package (straight または elpaca と組み合わせて)
@@ -611,11 +625,11 @@ Anvil を使うと:
 ;; straight 利用時
 (use-package anvil
   :straight (anvil :type git :host github :repo "zawatton/anvil.el"
-                   :branch "v1.3.0"))
+                   :branch "v1.4.1"))
 
 ;; elpaca 利用時
 (use-package anvil
-  :ensure (:host github :repo "zawatton/anvil.el" :ref "v1.3.0"))
+  :ensure (:host github :repo "zawatton/anvil.el" :ref "v1.4.1"))
 #+end_src
 
 ** 最新版 — =master= (強く非推奨)
@@ -666,7 +680,7 @@ user 向けです。
 (require 'anvil)
 #+end_src
 
-手動で clone する場合、安定版を使うなら =git checkout v1.3.0= で
+手動で clone する場合、安定版を使うなら =git checkout v1.4.1= で
 タグに切り替えてください。=master= のままは自己責任です。
 
 * 設定

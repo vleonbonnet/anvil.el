@@ -1,0 +1,28 @@
+name: Set up Emacs 31.1 on Windows
+description: Download the official GNU Emacs 31.1 Windows archive.
+runs:
+  using: composite
+  steps:
+    - name: Download and verify Emacs 31.1
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $archive = Join-Path $env:RUNNER_TEMP 'emacs-31.1.zip'
+        $destination = Join-Path $env:RUNNER_TEMP 'emacs-31.1'
+        Invoke-WebRequest `
+          -Uri 'https://ftp.gnu.org/gnu/emacs/windows/emacs-31/emacs-31.1.zip' `
+          -OutFile $archive
+        Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+
+        $emacs = Get-ChildItem -Path $destination -Filter emacs.exe -File -Recurse |
+          Where-Object { $_.Directory.Name -eq 'bin' } |
+          Select-Object -First 1
+        if (-not $emacs) {
+          throw 'The official Emacs 31.1 archive contains no bin/emacs.exe.'
+        }
+
+        Add-Content -Path $env:GITHUB_PATH -Value $emacs.Directory.FullName
+        & $emacs.FullName --batch -Q --eval '(unless (string= emacs-version "31.1") (error "Expected Emacs 31.1, got %s" emacs-version))'
+        if ($LASTEXITCODE -ne 0) {
+          throw "Emacs version validation failed with exit code $LASTEXITCODE."
+        }

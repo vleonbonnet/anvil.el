@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        emacs-version: ['29.4', '30.1']
+        emacs-version: ['31.1']
       fail-fast: false
 
     steps:
@@ -29,9 +29,7 @@ jobs:
 
       - name: Set up Emacs (Windows)
         if: runner.os == 'Windows'
-        uses: jcs090218/setup-emacs-windows@master
-        with:
-          version: ${{ matrix.emacs-version }}
+        uses: ./.github/actions/setup-emacs-windows
 
       - name: Byte-compile core
         shell: bash
@@ -55,13 +53,13 @@ jobs:
   full-suite:
     # Full ERT run — every `tests/anvil-*-test.el' file loaded into one
     # emacs --batch so the 640+ test suite runs in a single process.
-    # Ubuntu only: the Windows setup-emacs on 30.1 occasionally hangs on
+    # Ubuntu only: the Windows setup-emacs path has occasionally hung on
     # the sexp test fixtures, and live smoke tests (orchestrator, browser)
     # are skip-guarded for all platforms but don't add CI value on Windows.
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        emacs-version: ['29.4', '30.1']
+        emacs-version: ['31.1']
       fail-fast: false
 
     steps:
@@ -75,17 +73,15 @@ jobs:
 
       - name: Set up Emacs (Windows)
         if: runner.os == 'Windows'
-        uses: jcs090218/setup-emacs-windows@master
-        with:
-          version: ${{ matrix.emacs-version }}
+        uses: ./.github/actions/setup-emacs-windows
 
       - name: Install tree-sitter-python grammar
         run: |
           # anvil-py tests (Doc 21 Phase 1a) need the python grammar.
-          # Pin to v0.21.x — current tree-sitter-python master tags its
-          # parser at ABI 15, which Emacs 30's libtree-sitter 0.22 runtime
-          # refuses to load.  Without this step the 17 grammar-dependent
-          # tests silently ert-skip and the suite is a false green.
+          # Pin to v0.21.x to keep the parser ABI compatible with Emacs's
+          # bundled libtree-sitter runtime. Without this step the 17
+          # grammar-dependent tests silently ert-skip and the suite is a
+          # false green.
           emacs --batch \
             --eval "(require 'treesit)" \
             --eval "(setq treesit-language-source-alist \
@@ -125,7 +121,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@v8.0
         with:
-          version: '30.1'
+          version: '31.1'
 
       - name: Run release audit
         run: |

@@ -49,6 +49,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'anvil-bounded-data)
 (require 'anvil-server-metrics)
 
 ;; `anvil-offload' is an optional module — loaded on demand in
@@ -127,7 +128,16 @@ the whole message back into the model's context.  The signal data of
 an unexpected error can carry arbitrarily large objects (a buffer's
 text, a populated hash table), so unbounded error text can exceed the
 model's context window on its own.  Longer messages are cut and end
-with a trailer stating the original length.  Nil disables the cap."
+with a trailer stating the original length.  Nil disables only the final
+text cap; error data is still snapshotted with finite node, depth, and
+character budgets before printing."
+  :type '(choice (const :tag "Unlimited" nil) integer)
+  :group 'anvil-server)
+
+(defcustom anvil-server-max-inline-result-bytes (* 2 1024 1024)
+  "Maximum escaped UTF-8 bytes of successful inline tool-result text.
+The two JSON string quote delimiters are excluded.  Nil, zero, or a negative
+integer disables the limit.  Other values fail closed."
   :type '(choice (const :tag "Unlimited" nil) integer)
   :group 'anvil-server)
 
@@ -138,6 +148,43 @@ with a trailer stating the original length.  Nil disables the cap."
 
 (defconst anvil-server-protocol-version "2025-03-26"
   "Current MCP protocol version supported by this server.")
+
+(defconst anvil-server-modern-protocol-versions '("2026-07-28")
+  "Stateless MCP revisions served from per-request `_meta'.")
+
+(defconst anvil-server-unsupported-protocol-version-error -32022
+  "MCP 2026-07-28 UnsupportedProtocolVersion error code.")
+
+(defvar anvil-server--modern-request nil
+  "Protocol version of the modern request being served, or nil.
+Bound around dispatch so response builders add the modern result fields.")
+
+(defvar anvil-server--modern-result-extra nil
+  "Extra JSON members (a string such as \"\\\"ttlMs\\\":60000\") for the result.")
+
+(defun anvil-server--modern-result-prefix ()
+  "Return the JSON members every modern result starts with, plus a comma."
+  (concat "\"resultType\":\"complete\","
+          "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":"
+          (json-encode anvil-server-name)
+          ",\"version\":" (json-encode anvil-server-protocol-version) "}},"
+          (if anvil-server--modern-result-extra
+              (concat anvil-server--modern-result-extra ",")
+            "")))
+
+(defun anvil-server--modernize-result-json (result-json)
+  "Splice the modern result members into RESULT-JSON when serving modern.
+RESULT-JSON must be a JSON object string; it is returned unchanged for
+legacy requests and never mutated."
+  (if (and anvil-server--modern-request
+           (> (length result-json) 1)
+           (eq (aref result-json 0) ?{))
+      (let ((prefix (anvil-server--modern-result-prefix))
+            (rest (substring result-json 1)))
+        (if (eq (aref rest 0) ?})
+            (concat "{" (substring prefix 0 -1) rest)
+          (concat "{" prefix rest)))
+    result-json))
 
 ;;; Public API - JSON-RPC 2.0 Error Codes
 
@@ -155,6 +202,14 @@ with a trailer stating the original length.  Nil disables the cap."
 
 (defconst anvil-server-jsonrpc-error-internal -32603
   "JSON-RPC 2.0 Internal Error code.")
+
+(defconst anvil-server--inline-result-limit-error-text
+  "Inline tool result rejected: size limit configuration is invalid."
+  "Fixed content-free diagnostic returned for an invalid inline result limit.")
+
+(defconst anvil-server--inline-result-too-large-text
+  "Inline tool result rejected: output exceeds the configured size limit."
+  "Fixed content-free diagnostic returned for an oversized inline result.")
 
 ;;; Internal Constants
 
@@ -407,7 +462,7 @@ empty), so the cache round-trips purely through string ops + `load'
           (make-directory dir t))
         (write-region
          (concat
-          ";;; anvil-schema-cache.el --- generated  -*- lexical-binding: t; -*-\n"
+          ";;; -*- lexical-binding: t; no-byte-compile: t -*-\n"
           "(setq anvil-server--schema-cache-file-data '"
           (anvil-server--prin1-to-string
            (list :version anvil-server--schema-cache-version
@@ -482,180 +537,6 @@ in `tools/list' immediately.  The real module is loaded on first
                anvil-server--tools-list-cache))
     count))
 
-(defun anvil-server--scan-substr-pos (s needle)
-  "Return start index of NEEDLE in S, or nil.
-Pure char-by-char scan — does not depend on `string-match' which
-returns nil on raw-byte strings from `read-stdin-bytes' under
-standalone nelisp."
-  (let* ((s-len (length s))
-         (n-len (length needle))
-         (limit (- s-len n-len))
-         (i 0)
-         (found nil))
-    (while (and (<= i limit) (not found))
-      (let ((j 0) (ok t))
-        (while (and ok (< j n-len))
-          (if (eq (aref s (+ i j)) (aref needle j))
-              (setq j (1+ j))
-            (setq ok nil)))
-        (if ok (setq found i)
-          (setq i (1+ i)))))
-    found))
-
-(defun anvil-server--scan-int-after (s needle)
-  "Return integer after NEEDLE in S, tolerating whitespace, or nil."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle)))
-             (digits nil)
-             (saw-digit nil))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
-          (setq i (1+ i)))
-        (when (and (< i s-len) (eq (aref s i) ?-))
-          (push (aref s i) digits)
-          (setq i (1+ i)))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (and (>= c ?0) (<= c ?9))))
-          (push (aref s i) digits)
-          (setq saw-digit t)
-          (setq i (1+ i)))
-        (when saw-digit
-          (string-to-number (apply #'string (nreverse digits))))))))
-
-(defun anvil-server--scan-string-after (s needle)
-  "Return JSON string after NEEDLE in S, tolerating whitespace, or nil.
-NEEDLE should end at the colon before the value."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle)))
-             (chars nil))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
-          (setq i (1+ i)))
-        (when (and (< i s-len) (eq (aref s i) ?\"))
-          (setq i (1+ i))
-          (while (and (< i s-len) (not (eq (aref s i) ?\")))
-            (if (eq (aref s i) ?\\)
-                (progn
-                  (setq i (1+ i))
-                  (when (< i s-len)
-                    (push (aref s i) chars)
-                    (setq i (1+ i))))
-              (push (aref s i) chars)
-              (setq i (1+ i))))
-          (apply #'string (nreverse chars)))))))
-
-(defun anvil-server--scan-json-value-after (s needle)
-  "Return a string or integer JSON value after NEEDLE in S, or nil."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle))))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
-          (setq i (1+ i)))
-        (cond
-         ((and (< i s-len) (eq (aref s i) ?\"))
-          (anvil-server--scan-string-after s needle))
-         ((and (< i s-len)
-               (let ((c (aref s i)))
-                 (or (eq c ?-) (and (>= c ?0) (<= c ?9)))))
-          (anvil-server--scan-int-after s needle))
-         (t nil))))))
-
-(defun anvil-server--scan-flat-object-after (s needle)
-  "Parse a flat JSON object that begins right after NEEDLE in S.
-Returns an alist `((SYMBOL . STRING-OR-INT) ...)' or nil if no
-match.  Handles the bounded shape used by MCP tool arguments:
-`{\"key1\":\"val1\",\"key2\":42,\"key3\":\"val3\"}'.  Bypasses
-json-read-from-string (broken on read-stdin-bytes strings under
-standalone nelisp)."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle)))
-             ;; Skip optional whitespace + opening `{'.
-             (_skip-open
-              (progn
-                (while (and (< i s-len)
-                            (let ((c (aref s i)))
-                              (or (eq c ?\s) (eq c ?\t) (eq c ?\n))))
-                  (setq i (1+ i)))
-                (when (and (< i s-len) (eq (aref s i) ?\{))
-                  (setq i (1+ i)))))
-             (result nil)
-             (done nil))
-        (while (and (not done) (< i s-len))
-          ;; Skip whitespace and commas
-          (while (and (< i s-len)
-                      (let ((c (aref s i)))
-                        (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?,))))
-            (setq i (1+ i)))
-          (cond
-           ((>= i s-len) (setq done t))
-           ((eq (aref s i) ?\})
-            (setq done t))
-           ((eq (aref s i) ?\")
-            ;; Read key string
-            (setq i (1+ i))
-            (let ((key-chars nil))
-              (while (and (< i s-len) (not (eq (aref s i) ?\")))
-                (push (aref s i) key-chars)
-                (setq i (1+ i)))
-              (when (< i s-len) (setq i (1+ i))) ; consume closing "
-              ;; Skip whitespace + colon
-              (while (and (< i s-len)
-                          (let ((c (aref s i)))
-                            (or (eq c ?\s) (eq c ?\t) (eq c ?:))))
-                (setq i (1+ i)))
-              ;; Read value
-              (let ((key (intern (apply #'string (nreverse key-chars))))
-                    (val nil))
-                (cond
-                 ((and (< i s-len) (eq (aref s i) ?\"))
-                  (setq i (1+ i))
-                  (let ((val-chars nil))
-                    (while (and (< i s-len) (not (eq (aref s i) ?\")))
-                      ;; Minimal escape handling: skip a single backslash
-                      ;; and copy the next char verbatim (covers `\"' and
-                      ;; `\\' for typical MCP args).
-                      (if (eq (aref s i) ?\\)
-                          (progn
-                            (setq i (1+ i))
-                            (when (< i s-len)
-                              (push (aref s i) val-chars)
-                              (setq i (1+ i))))
-                        (push (aref s i) val-chars)
-                        (setq i (1+ i))))
-                    (when (< i s-len) (setq i (1+ i))) ; consume closing "
-                    (setq val (apply #'string (nreverse val-chars)))))
-                 ((and (< i s-len)
-                       (let ((c (aref s i)))
-                         (or (eq c ?-)
-                             (and (>= c ?0) (<= c ?9)))))
-                  (let ((num-chars nil))
-                    (while (and (< i s-len)
-                                (let ((c (aref s i)))
-                                  (or (eq c ?-)
-                                      (eq c ?.)
-                                      (and (>= c ?0) (<= c ?9)))))
-                      (push (aref s i) num-chars)
-                      (setq i (1+ i)))
-                    (setq val
-                          (string-to-number
-                           (apply #'string (nreverse num-chars))))))
-                 (t (setq done t)))
-                (push (cons key val) result))))
-           (t (setq i (1+ i)))))
-        (nreverse result)))))
-
 (defun anvil-server--jsonrpc-response (id result)
   "Create a JSON-RPC response with ID and RESULT."
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
@@ -666,7 +547,10 @@ standalone nelisp)."
               (nelisp--write-stderr-line
                (format "[JR] form-built %.4fs" (- (float-time) t0)))))
          (t1 (float-time))
-         (out (json-encode form)))
+         (out (if anvil-server--modern-request
+                  (anvil-server--jsonrpc-response-from-result-json
+                   id (if result (json-encode result) "{}"))
+                (json-encode form))))
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (format "[JR] json-encode %.4fs len=%d"
@@ -713,7 +597,7 @@ a full json-encode of the (potentially ~20KB) result object."
            ((stringp id) (json-encode id))
            (t (json-encode id)))
           ",\"result\":"
-          result-json
+          (anvil-server--modernize-result-json result-json)
           "}"))
 
 
@@ -948,8 +832,8 @@ symbol properties) keep the original handler as the source of truth for
 schema extraction and argument binding while transport encoding happens
 after execution."
   (let* ((raw-handler
-          (if-let ((wrapped (and (symbolp handler)
-                                 (get handler 'anvil-server-raw-handler))))
+          (if-let* ((wrapped (and (symbolp handler)
+                                  (get handler 'anvil-server-raw-handler))))
               wrapped
             handler))
          (encode-result
@@ -965,9 +849,9 @@ If KEY already exists, increment its reference count.
 Otherwise, add ITEM to TABLE with :ref-count 1.
 Returns nil."
   (if-let* ((existing (gethash key table)))
-    ;; Item already exists - increment ref count
-    (let ((ref-count (or (plist-get existing :ref-count) 1)))
-      (plist-put existing :ref-count (1+ ref-count)))
+      ;; Item already exists - increment ref count
+      (let ((ref-count (or (plist-get existing :ref-count) 1)))
+        (plist-put existing :ref-count (1+ ref-count)))
     ;; New item - ensure it has ref-count = 1
     (plist-put item :ref-count 1)
     (puthash key item table))
@@ -980,14 +864,14 @@ Otherwise, remove the item from TABLE.
 Returns t if item was found, nil otherwise."
   (if-let* ((item (gethash key table))
             (ref-count (or (plist-get item :ref-count) 1)))
-    (if (> ref-count 1)
-        ;; Decrement ref count
-        (progn
-          (plist-put item :ref-count (1- ref-count))
-          t)
-      ;; Last reference - remove the item
-      (remhash key table)
-      t)))
+      (if (> ref-count 1)
+          ;; Decrement ref count
+          (progn
+            (plist-put item :ref-count (1- ref-count))
+            t)
+        ;; Last reference - remove the item
+        (remhash key table)
+        t)))
 
 (defun anvil-server--jsonrpc-error (id code message)
   "Create a JSON-RPC error response with ID, error CODE and MESSAGE."
@@ -1086,13 +970,42 @@ failed.  JSON-RPC 2.0 requires error responses to echo the request
 id; a client cannot match an `id: null' error against its pending
 request and may wait forever.")
 
+(defun anvil-server--condition-message (err)
+  "Return ERR's message after snapshotting it before native formatting.
+The snapshot uses independent node, depth, and character limits; the
+caller applies any final response cap separately."
+  (let* ((snapshot
+          (let ((anvil-bounded-data--snapshot-node-limit 512)
+                (anvil-bounded-data--snapshot-depth-limit 8)
+                (anvil-bounded-data--snapshot-char-limit 4096))
+            (anvil-bounded-data--bounded-snapshot err))))
+    (let ((anvil-bounded-data--snapshot-node-limit 512)
+          (anvil-bounded-data--snapshot-depth-limit 8)
+          (anvil-bounded-data--snapshot-char-limit 4096))
+      (plist-get (anvil-bounded-data--render-snapshot snapshot 4096 0)
+                 :message))))
+
+(defun anvil-server--condition-raw-context (err)
+  "Return ERR's bounded raw diagnostic context before printing.
+The snapshot and render limits bound diagnostic work independently of
+the final response cap."
+  (let* ((anvil-bounded-data--snapshot-node-limit 512)
+         (anvil-bounded-data--snapshot-depth-limit 8)
+         (anvil-bounded-data--snapshot-char-limit 4096)
+         (snapshot (anvil-bounded-data--bounded-snapshot err)))
+    (let ((anvil-bounded-data--snapshot-node-limit 512)
+          (anvil-bounded-data--snapshot-depth-limit 8)
+          (anvil-bounded-data--snapshot-char-limit 4096))
+      (plist-get (anvil-bounded-data--render-snapshot snapshot 0 4096)
+                 :raw-context))))
+
 (defun anvil-server--handle-error (err)
   "Handle error ERR in MCP process by logging and creating an error response.
 Returns a JSON-RPC error response string for internal errors."
   (anvil-server--jsonrpc-error
    anvil-server--current-request-id
    anvil-server-jsonrpc-error-internal
-   (format "Internal error: %s" (error-message-string err))))
+   (format "Internal error: %s" (anvil-server--condition-message err))))
 
 (defun anvil-server--validate-and-dispatch-request
     (request server-id)
@@ -1154,8 +1067,46 @@ Returns a JSON-RPC formatted response string, or nil for notifications."
 
      ;; Process valid request
      (t
-      (anvil-server--dispatch-jsonrpc-method
-       id method params server-id)))))
+      (anvil-server--dispatch-by-era id method params server-id)))))
+
+(defun anvil-server--request-protocol-version (params)
+  "Return the modern protocol version declared in PARAMS' `_meta', or nil."
+  (let ((meta (and (listp params) (alist-get '_meta params))))
+    (and (listp meta)
+         (alist-get 'io.modelcontextprotocol/protocolVersion meta))))
+
+(defun anvil-server--dispatch-by-era (id method params server-id)
+  "Dispatch METHOD for SERVER-ID in the era its PARAMS declare.
+A request with modern `_meta' is served statelessly (MCP 2026-07-28);
+anything else keeps initialize-era behavior.  ID is the request id."
+  (let ((version (anvil-server--request-protocol-version params)))
+    (cond
+     ((null version)
+      (anvil-server--dispatch-jsonrpc-method id method params server-id))
+     ((not (member version anvil-server-modern-protocol-versions))
+      (if id
+          (json-encode
+           `((jsonrpc . "2.0")
+             (id . ,id)
+             (error
+              . ((code . ,anvil-server-unsupported-protocol-version-error)
+                 (message . "Unsupported protocol version")
+                 (data
+                  . ((supported
+                      . ,(vconcat anvil-server-modern-protocol-versions
+                                  (list anvil-server-protocol-version)))
+                     (requested . ,version)))))))
+        nil))
+     ((equal method "initialize")
+      ;; An initialize request selects legacy semantics even with _meta.
+      (anvil-server--dispatch-jsonrpc-method id method params server-id))
+     ((equal method "server/discover")
+      (let ((anvil-server--modern-request version))
+        (anvil-server--handle-discover id server-id)))
+     (t
+      (let ((anvil-server--modern-request version))
+        (anvil-server--dispatch-jsonrpc-method
+         id method params server-id))))))
 
 ;;; Resource Template Support
 
@@ -1298,14 +1249,19 @@ METHOD-METRICS is used to track errors."
      (cl-incf (anvil-server-metrics-errors method-metrics))
      (anvil-server--jsonrpc-error
       id anvil-server-jsonrpc-error-internal
-      (format "Resource handler quit for %s: %S" uri err)))
+      (format "Resource handler quit for %s: %s"
+              (anvil-server-truncate-text
+               (anvil-server--condition-message uri) 128)
+              (anvil-server--condition-raw-context err))))
     ;; Handle any other error from the handler
     (error
      (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
      (anvil-server--jsonrpc-error
       id anvil-server-jsonrpc-error-internal
       (format "Error reading resource %s: %s"
-              uri (error-message-string err))))))
+              (anvil-server-truncate-text
+               (anvil-server--condition-message uri) 128)
+              (anvil-server--condition-message err))))))
 
 (defun anvil-server--handle-resources-read
     (id params method-metrics server-id)
@@ -1378,6 +1334,44 @@ Returns a JSON-RPC response string for the request."
        (format "Method not found: %s" method))))))
 
 ;;; Notification handlers
+
+(defun anvil-server--capabilities-json (server-id)
+  "Return the capabilities object JSON advertised for SERVER-ID."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         (tools-table (gethash resolved-id anvil-server--tools))
+         (resources-table (gethash resolved-id anvil-server--resources))
+         (templates-table
+          (gethash resolved-id anvil-server--resource-templates)))
+    (concat "{"
+            (mapconcat
+             #'identity
+             (delq nil
+                   (list
+                    (when (and tools-table
+                               (> (hash-table-count tools-table) 0))
+                      "\"tools\":{}")
+                    (when (or (and resources-table
+                                   (> (hash-table-count resources-table) 0))
+                              (and templates-table
+                                   (> (hash-table-count templates-table) 0)))
+                      "\"resources\":{}")))
+             ",")
+            "}")))
+
+(defun anvil-server--handle-discover (id server-id)
+  "Handle modern `server/discover' request ID for SERVER-ID.
+Advertise the supported protocol versions of both eras and the same
+capabilities `initialize' reports."
+  (anvil-server--jsonrpc-response-from-result-json
+   id
+   (concat "{\"supportedVersions\":["
+           (mapconcat #'json-encode
+                      (append anvil-server-modern-protocol-versions
+                              (list anvil-server-protocol-version))
+                      ",")
+           "],\"capabilities\":"
+           (anvil-server--capabilities-json server-id)
+           "}")))
 
 (defun anvil-server--handle-initialize (id server-id)
   "Handle initialize request with ID for SERVER-ID.
@@ -1512,7 +1506,7 @@ main dispatch flow."
                             err tool-name source)
       (error
        (message "anvil-server: tool-error-hook failed: %s"
-                (error-message-string hook-err))))))
+                (anvil-server--condition-message hook-err))))))
 
 (defvar anvil-server-id-aliases nil
   "Alist mapping virtual server-ids to real server-ids.
@@ -1544,7 +1538,10 @@ Perf (2026-05-11): the JSON-encoded `result' object is cached per
 server-id in `anvil-server--tools-list-cache' and skips full
 json-encode on subsequent calls.  The cache is invalidated by
 register / unregister."
-  (let* ((resolved-id (anvil-server--resolve-id server-id))
+  (let* ((anvil-server--modern-result-extra
+          (and anvil-server--modern-request
+               "\"ttlMs\":60000,\"cacheScope\":\"private\""))
+         (resolved-id (anvil-server--resolve-id server-id))
          ;; Filter function may have stateful side effects keyed off
          ;; the *virtual* server-id (= unresolved).  We still cache
          ;; by resolved-id because the maphash domain (= tools table)
@@ -1616,10 +1613,10 @@ IS-TEMPLATE indicates whether this is a template resource."
          (base-entry
           `((,uri-field . ,uri-or-template) (name . ,name))))
     (anvil-server--append-optional-fields base-entry
-                                            'description
-                                            description
-                                            'mimeType
-                                            mime-type)))
+                                          'description
+                                          description
+                                          'mimeType
+                                          mime-type)))
 
 (defun anvil-server--collect-resources-from-hash
     (hash-table is-template)
@@ -1668,6 +1665,44 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
     (anvil-server--jsonrpc-response
      id `((resourceTemplates . ,template-list)))))
 
+(defun anvil-server--projected-json-string-bytes (text &optional stop-after)
+  "Return projected JSON-escaped UTF-8 bytes for TEXT, excluding quotes.
+When STOP-AFTER is a non-negative integer, stop once the count exceeds it.
+This projector does not call the JSON encoder or build an escaped copy."
+  (unless (stringp text)
+    (signal 'wrong-type-argument (list 'stringp text)))
+  (let ((index 0)
+        (total 0)
+        (multibyte (multibyte-string-p text)))
+    (catch 'done
+      (while (< index (length text))
+        (let ((character (aref text index)))
+          (setq total
+                (+ total
+                   (cond
+                    ((or (= character ?\") (= character ?\\)) 2)
+                    ((memq character '(8 9 10 12 13)) 2)
+                    ((< character 32) 6)
+                    ((and (not multibyte) (>= character 128)) 5)
+                    ((>= character #x200000) 5)
+                    ((< character #x80) 1)
+                    ((< character #x800) 2)
+                    ((< character #x10000) 3)
+                    (t 4))))
+          (setq index (1+ index))
+          (when (and (integerp stop-after) (>= stop-after 0)
+                     (> total stop-after))
+            (throw 'done total))))
+      total)))
+
+(defun anvil-server--inline-result-over-limit-p (text)
+  "Return non-nil if TEXT projects beyond the configured positive limit."
+  (and (integerp anvil-server-max-inline-result-bytes)
+       (> anvil-server-max-inline-result-bytes 0)
+       (> (anvil-server--projected-json-string-bytes
+           text anvil-server-max-inline-result-bytes)
+          anvil-server-max-inline-result-bytes)))
+
 (defun anvil-server--handle-tools-call
     (id params method-metrics server-id)
   "Handle tools/call request with ID and PARAMS for SERVER-ID.
@@ -1690,207 +1725,244 @@ virtual server-ids share the same handler pool."
             (when tools-table
               (gethash tool-name tools-table))))
     (if tool
-        (let ((handler (plist-get tool :handler))
-              (context (list :id id)))
-          (condition-case err
-              (let*
-                  ((arglist
-                    (progn
-                      (unless (or (functionp handler)
-                                  (and (symbolp handler) (fboundp handler)))
-                        (signal 'void-function (list handler)))
-                      ;; Keep dispatch aligned with registration-time
-                      ;; schema extraction, including transport-only
-                      ;; wrappers created by `anvil-server-encode-handler'.
-                      (or (plist-get tool :arglist)
-                          (help-function-arglist handler t))))
-                   (expected-params '())
-                   (required-params '())
-                   (provided-params '())
-                   (arg-values '())
-                   (seen-optional nil)
-                   (raw-result
-                    (progn
-                      ;; Collect expected and required parameter names.
-                      ;; `_'-prefixed args follow the Elisp unused-arg
-                      ;; convention — they are hidden from the client-facing
-                      ;; schema (see `anvil-server--generate-schema-from-function')
-                      ;; and must be skipped here too.
-                      (dolist (param arglist)
-                        (let ((param-name (symbol-name param)))
-                          (cond
-                           ((string= param-name "&optional")
-                            (setq seen-optional t))
-                           ((string-prefix-p "_" param-name)
-                            nil)
-                           (t
-                            (push (intern param-name) expected-params)
-                            (unless seen-optional
-                              (push (intern param-name)
-                                    required-params))))))
-                      ;; Collect provided parameter names
-                      (dolist (arg tool-args)
-                        (push (car arg) provided-params))
-                      ;; Check for missing required parameters
-                      (dolist (required required-params)
-                        (unless (memq required provided-params)
-                          (signal
-                           'anvil-server-invalid-params
-                           (list
-                            (format
-                             (concat
-                              "Missing required parameter: %s. "
-                              "Each parameter must be a separate field "
-                              "in the JSON input object — do not embed "
-                              "XML-style tags such as </%s> or "
-                              "<parameter name=\"%s\"> inside another "
-                              "parameter's string value.")
-                             required required required)))))
-                      ;; Check for unexpected parameters.  `_'-prefixed
-                      ;; names are silently accepted even when not in
-                      ;; `expected-params' — a stale client that still has
-                      ;; a pre-fix schema may send them.  We just drop them.
-                      (dolist (provided provided-params)
-                        (unless
-                            (or (string-prefix-p
-                                 "_" (symbol-name provided))
-                                (memq provided expected-params))
-                          (signal
-                           'anvil-server-invalid-params
-                           (list
-                            (format "Unexpected parameter: %s"
-                                    provided)))))
-                      ;; All validation passed, collect values and call handler.
-                      ;; `_'-prefixed args always receive nil (client can't send them).
-                      (dolist (param arglist)
-                        (let ((param-name (symbol-name param)))
-                          (unless (string= param-name "&optional")
-                            (let ((value
-                                   (if (string-prefix-p "_" param-name)
-                                       nil
-                                     (alist-get
-                                      (intern param-name) tool-args))))
-                              (push value arg-values)))))
-                      (let ((final-args (nreverse arg-values))
-                            (anvil-server--current-tool-name tool-name))
-                        (if (plist-get tool :offload)
-                            (anvil-server--offload-apply
-                             tool handler final-args)
-                          (apply handler final-args)))))
-                   ;; `anvil-server-encode-handler' marks tools that want
-                   ;; transport-level JSON encoding while their raw
-                   ;; handler keeps returning rich Lisp data.
-                   (result
-                    (if (plist-get tool :encode-result)
-                        (anvil-server-encode-for-mcp raw-result)
-                      raw-result))
-                   ;; Coerce result to string for MCP transport.
-                   ;;
-                   ;; Contract widen (T118 / T97-FOLLOWUP-1):
-                   ;;   string / nil  → pass through (legacy)
-                   ;;   plist / list / cons / hash-table / vector
-                   ;;                 → JSON-encode via
-                   ;;                   `anvil-server-encode-for-mcp'
-                   ;;   symbol / function / buffer / process / marker
-                   ;;                 → reject (cannot be wire-encoded)
-                   ;;
-                   ;; This removes the "string or nil" hard reject that
-                   ;; surfaced as `defs-index-status` etc returning a
-                   ;; plist (= boot-smoke WARN, T97 M1 / T110 M2).  The
-                   ;; existing `:encode-result' wrapper path stays the
-                   ;; preferred long-form (it round-trips through the
-                   ;; raw handler for ERT), but un-wrapped handlers no
-                   ;; longer need to hand-stringify.
-                   (result-text
-                    (cond
-                     ((null result)
-                      "")
-                     ((stringp result)
-                      result)
-                     ((or (consp result)        ; plist / alist / list / dotted
-                          (hash-table-p result)
-                          (vectorp result))
-                      (anvil-server-encode-for-mcp result))
-                     (t
-                      (signal
-                       'anvil-server-invalid-params
-                       (list
-                        (format
-                         (concat
-                          "Tool handler must return a JSON-serialisable"
-                          " value (string / nil / plist / list /"
-                          " hash-table / vector), got: %s")
-                         (type-of result)))))))
-                   (result-text
-                    (if (fboundp 'anvil-disclosure-budget-apply)
-                        (anvil-disclosure-budget-apply tool-name result-text)
-                      result-text))
-                   ;; Wrap the handler result in the MCP format
-                   (formatted-result
-                    `((content
-                       .
-                       ,(vector
-                         `((type . "text") (text . ,result-text))))
-                      (isError . :json-false))))
-                (anvil-server-metrics--track-tool-payload
-                 tool-name tool-args result-text)
-                (anvil-server-metrics--track-tool-call tool-name)
-                (condition-case hook-err
-                    (run-hook-with-args
-                     'anvil-server-tool-dispatch-hook
-                     tool-name server-id)
-                  (error
-                   (message "anvil-server: dispatch-hook error on %s: %s"
-                            tool-name
-                            (error-message-string hook-err))))
-                (anvil-server--respond-with-result
-                 context formatted-result))
-            ;; Handle invalid parameter errors
-            (anvil-server-invalid-params
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-             (anvil-server--run-tool-error-hook
-              err tool-name 'dispatcher-validation)
-             (anvil-server--jsonrpc-error
-              id
-              anvil-server-jsonrpc-error-invalid-params
-              (cadr err)))
-            ;; Handle tool-specific errors thrown with
-            ;; anvil-server-tool-throw
-            (anvil-server-tool-error
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-             (let ((formatted-error
-                    `((content
-                       .
-                       ,(vector
-                         `((type . "text")
-                           (text . ,(anvil-server-truncate-text
-                                     (cadr err)
-                                     anvil-server-tool-error-max-chars)))))
-                      (isError . t))))
-               (anvil-server--respond-with-result
-                context formatted-error)))
-            (quit
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
-             (anvil-server--jsonrpc-error
-              id anvil-server-jsonrpc-error-internal
-              (format "Tool handler quit: %S" err)))
-            ;; Keep existing handling for all other errors
-            (error
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-             (anvil-server--run-tool-error-hook
-              err tool-name 'tool-body)
-             (anvil-server--jsonrpc-error
-              id anvil-server-jsonrpc-error-internal
-              (anvil-server-truncate-text
-               (format "Internal error executing tool: %s"
-                       (let ((print-length 64)
-                             (print-level 8))
-                         (error-message-string err)))
-               anvil-server-tool-error-max-chars)))))
+        (if (not (or (null anvil-server-max-inline-result-bytes)
+                     (and (integerp anvil-server-max-inline-result-bytes)
+                          (<= anvil-server-max-inline-result-bytes 0))
+                     (and (integerp anvil-server-max-inline-result-bytes)
+                          (> anvil-server-max-inline-result-bytes 0))))
+            (progn
+              (anvil-server-metrics--track-tool-call tool-name t)
+              (anvil-server--metrics-bump
+               (anvil-server-metrics-errors method-metrics))
+              (anvil-server--respond-with-result
+               (list :id id)
+               `((content . [((type . "text")
+                              (text . ,anvil-server--inline-result-limit-error-text))])
+                 (isError . t))))
+          (let ((handler (plist-get tool :handler))
+                (context (list :id id)))
+            (condition-case err
+                (let*
+                    ((arglist
+                      (progn
+                        (unless (or (functionp handler)
+                                    (and (symbolp handler) (fboundp handler)))
+                          (signal 'void-function (list handler)))
+                        ;; Keep dispatch aligned with registration-time
+                        ;; schema extraction, including transport-only
+                        ;; wrappers created by `anvil-server-encode-handler'.
+                        (or (plist-get tool :arglist)
+                            (help-function-arglist handler t))))
+                     (expected-params '())
+                     (required-params '())
+                     (provided-params '())
+                     (arg-values '())
+                     (seen-optional nil)
+                     (raw-result
+                      (progn
+                        ;; Collect expected and required parameter names.
+                        ;; `_'-prefixed args follow the Elisp unused-arg
+                        ;; convention — they are hidden from the client-facing
+                        ;; schema (see `anvil-server--generate-schema-from-function')
+                        ;; and must be skipped here too.
+                        (dolist (param arglist)
+                          (let ((param-name (symbol-name param)))
+                            (cond
+                             ((string= param-name "&optional")
+                              (setq seen-optional t))
+                             ((string-prefix-p "_" param-name)
+                              nil)
+                             (t
+                              (push (intern param-name) expected-params)
+                              (unless seen-optional
+                                (push (intern param-name)
+                                      required-params))))))
+                        ;; Collect provided parameter names
+                        (dolist (arg tool-args)
+                          (push (car arg) provided-params))
+                        ;; Check for missing required parameters
+                        (dolist (required required-params)
+                          (unless (memq required provided-params)
+                            (signal
+                             'anvil-server-invalid-params
+                             (list
+                              (format
+                               (concat
+                                "Missing required parameter: %s. "
+                                "Each parameter must be a separate field "
+                                "in the JSON input object — do not embed "
+                                "XML-style tags such as </%s> or "
+                                "<parameter name=\"%s\"> inside another "
+                                "parameter's string value.")
+                               required required required)))))
+                        ;; Check for unexpected parameters.  `_'-prefixed
+                        ;; names are silently accepted even when not in
+                        ;; `expected-params' — a stale client that still has
+                        ;; a pre-fix schema may send them.  We just drop them.
+                        (dolist (provided provided-params)
+                          (unless
+                              (or (string-prefix-p
+                                   "_" (symbol-name provided))
+                                  (memq provided expected-params))
+                            (signal
+                             'anvil-server-invalid-params
+                             (list
+                              (format "Unexpected parameter: %s"
+                                      provided)))))
+                        ;; All validation passed, collect values and call handler.
+                        ;; `_'-prefixed args always receive nil (client can't send them).
+                        (dolist (param arglist)
+                          (let ((param-name (symbol-name param)))
+                            (unless (string= param-name "&optional")
+                              (let ((value
+                                     (if (string-prefix-p "_" param-name)
+                                         nil
+                                       (alist-get
+                                        (intern param-name) tool-args))))
+                                (push value arg-values)))))
+                        (let ((final-args (nreverse arg-values))
+                              (anvil-server--current-tool-name tool-name))
+                          (if (plist-get tool :offload)
+                              (anvil-server--offload-apply
+                               tool handler final-args)
+                            (apply handler final-args)))))
+                     ;; `anvil-server-encode-handler' marks tools that want
+                     ;; transport-level JSON encoding while their raw
+                     ;; handler keeps returning rich Lisp data.
+                     (result
+                      (if (plist-get tool :encode-result)
+                          (anvil-server-encode-for-mcp raw-result)
+                        raw-result))
+                     ;; Coerce result to string for MCP transport.
+                     ;;
+                     ;; Contract widen (T118 / T97-FOLLOWUP-1):
+                     ;;   string / nil  → pass through (legacy)
+                     ;;   plist / list / cons / hash-table / vector
+                     ;;                 → JSON-encode via
+                     ;;                   `anvil-server-encode-for-mcp'
+                     ;;   symbol / function / buffer / process / marker
+                     ;;                 → reject (cannot be wire-encoded)
+                     ;;
+                     ;; This removes the "string or nil" hard reject that
+                     ;; surfaced as `defs-index-status` etc returning a
+                     ;; plist (= boot-smoke WARN, T97 M1 / T110 M2).  The
+                     ;; existing `:encode-result' wrapper path stays the
+                     ;; preferred long-form (it round-trips through the
+                     ;; raw handler for ERT), but un-wrapped handlers no
+                     ;; longer need to hand-stringify.
+                     (raw-result-text
+                      (cond
+                       ((null result)
+                        "")
+                       ((stringp result)
+                        result)
+                       ((or (consp result)        ; plist / alist / list / dotted
+                            (hash-table-p result)
+                            (vectorp result))
+                        (anvil-server-encode-for-mcp result))
+                       (t
+                        (signal
+                         'anvil-server-invalid-params
+                         (list
+                          (format
+                           (concat
+                            "Tool handler must return a JSON-serialisable"
+                            " value (string / nil / plist / list /"
+                            " hash-table / vector), got: %s")
+                           (type-of result)))))))
+                     (initial-overflow
+                      (and (stringp raw-result-text)
+                           (anvil-server--inline-result-over-limit-p
+                            raw-result-text)))
+                     (disclosed-result-text
+                      (if initial-overflow
+                          raw-result-text
+                        (if (fboundp 'anvil-disclosure-budget-apply)
+                            (anvil-disclosure-budget-apply
+                             tool-name raw-result-text)
+                          raw-result-text)))
+                     (final-overflow
+                      (or initial-overflow
+                          (and (stringp disclosed-result-text)
+                               (anvil-server--inline-result-over-limit-p
+                                disclosed-result-text))))
+                     (final-result-text
+                      (if final-overflow
+                          anvil-server--inline-result-too-large-text
+                        (substring-no-properties disclosed-result-text)))
+                     ;; Wrap the handler result in the MCP format
+                     (formatted-result
+                      `((content
+                         .
+                         ,(vector
+                           `((type . "text") (text . ,final-result-text))))
+                        (isError . ,(if final-overflow t :json-false)))))
+                  (if final-overflow
+                      (progn
+                        (anvil-server-metrics--track-tool-call tool-name t)
+                        (anvil-server--metrics-bump
+                         (anvil-server-metrics-errors method-metrics))
+                        (anvil-server--respond-with-result
+                         context formatted-result))
+                    (anvil-server-metrics--track-tool-payload
+                     tool-name tool-args final-result-text)
+                    (anvil-server-metrics--track-tool-call tool-name)
+                    (condition-case hook-err
+                        (run-hook-with-args
+                         'anvil-server-tool-dispatch-hook
+                         tool-name server-id)
+                      (error
+                       (message "anvil-server: dispatch-hook error on %s: %s"
+                                (anvil-server-truncate-text
+                                 (anvil-server--condition-message tool-name) 128)
+                                (anvil-server--condition-message hook-err))))
+                    (anvil-server--respond-with-result
+                     context formatted-result)))
+              ;; Handle invalid parameter errors
+              (anvil-server-invalid-params
+               (anvil-server-metrics--track-tool-call tool-name t)
+               (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
+               (anvil-server--run-tool-error-hook
+                err tool-name 'dispatcher-validation)
+               (anvil-server--jsonrpc-error
+                id
+                anvil-server-jsonrpc-error-invalid-params
+                (cadr err)))
+              ;; Handle tool-specific errors thrown with
+              ;; anvil-server-tool-throw
+              (anvil-server-tool-error
+               (anvil-server-metrics--track-tool-call tool-name t)
+               (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
+               (let ((formatted-error
+                      `((content
+                         .
+                         ,(vector
+                           `((type . "text")
+                             (text . ,(anvil-server-truncate-text
+                                       (cadr err)
+                                       anvil-server-tool-error-max-chars)))))
+                        (isError . t))))
+                 (anvil-server--respond-with-result
+                  context formatted-error)))
+              (quit
+               (anvil-server-metrics--track-tool-call tool-name t)
+               (cl-incf (anvil-server-metrics-errors method-metrics))
+               (anvil-server--jsonrpc-error
+                id anvil-server-jsonrpc-error-internal
+                (format "Tool handler quit: %s"
+                        (anvil-server--condition-raw-context err))))
+              ;; Keep existing handling for all other errors
+              (error
+               (anvil-server-metrics--track-tool-call tool-name t)
+               (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
+               (anvil-server--run-tool-error-hook
+                err tool-name 'tool-body)
+               (anvil-server--jsonrpc-error
+                id anvil-server-jsonrpc-error-internal
+                (anvil-server-truncate-text
+                 (format "Internal error executing tool: %s"
+                         (anvil-server--condition-message err))
+                 anvil-server-tool-error-max-chars))))))
       (anvil-server-metrics--track-tool-call tool-name t)
       (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
       (anvil-server--jsonrpc-error
@@ -2000,15 +2072,23 @@ reader how to get a smaller result."
 
 (defun anvil-server-format-tool-error (err)
   "Return the \"Error: ...\" tool message for condition ERR.
-The signal data is printed with bounded `print-length' and
-`print-level' so a huge object carried by ERR is elided while it is
-printed rather than after, then the text is capped at
-`anvil-server-tool-error-max-chars'."
-  (anvil-server-truncate-text
-   (let ((print-length 64)
-         (print-level 8))
-     (format "Error: %S" err))
-   anvil-server-tool-error-max-chars))
+The data is snapshotted with finite budgets before printing, then rendered
+with bounded `print-length' and `print-level'.  The final text is capped at
+`anvil-server-tool-error-max-chars'; disabling that cap does not disable the
+snapshot budgets.  Large data may be elided or replaced by markers."
+  (let* ((snapshot
+          (let ((anvil-bounded-data--snapshot-node-limit 512)
+                (anvil-bounded-data--snapshot-depth-limit 8)
+                (anvil-bounded-data--snapshot-char-limit 4096))
+            (plist-get (anvil-bounded-data--bounded-snapshot err) :value)))
+         (text
+          (let ((print-length 64)
+                (print-level 8)
+                (print-circle t)
+                (print-gensym nil)
+                (float-output-format nil))
+            (format "Error: %S" snapshot))))
+    (anvil-server-truncate-text text anvil-server-tool-error-max-chars)))
 
 (defmacro anvil-server-with-error-handling (&rest body)
   "Execute BODY with automatic error handling for MCP tools.
@@ -2051,6 +2131,67 @@ See also: `anvil-server-tool-throw'"
 
 ;;; API - Transport
 
+(defun anvil-server--string-to-utf8-bytes (string)
+  "Return STRING as a unibyte UTF-8 byte string."
+  (if (not (multibyte-string-p string))
+      string
+    ;; Measured 2026-08-28 with "あ": NeLisp v1.1.0+1
+    ;; `string-as-unibyte' => (227 129 130); Emacs 30.1
+    ;; `encode-coding-string' => (227 129 130).
+    (if (fboundp 'nelisp--write-stderr-line)
+        (string-as-unibyte string)
+      (encode-coding-string string 'utf-8 t))))
+
+(defun anvil-server--valid-utf8-bytes-p (string)
+  "Return non-nil when unibyte STRING is well-formed UTF-8."
+  (let ((i 0)
+        (n (length string))
+        (valid t))
+    (while (and valid (< i n))
+      (let ((b0 (aref string i)))
+        (cond
+         ((< b0 #x80)
+          (setq i (1+ i)))
+         ((and (>= b0 #xC2) (<= b0 #xDF)
+               (< (1+ i) n)
+               (>= (aref string (1+ i)) #x80)
+               (<= (aref string (1+ i)) #xBF))
+          (setq i (+ i 2)))
+         ((and (>= b0 #xE0) (<= b0 #xEF)
+               (< (+ i 2) n)
+               (let ((b1 (aref string (1+ i))))
+                 (and (if (= b0 #xE0) (>= b1 #xA0) (>= b1 #x80))
+                      (if (= b0 #xED) (<= b1 #x9F) (<= b1 #xBF))))
+               (>= (aref string (+ i 2)) #x80)
+               (<= (aref string (+ i 2)) #xBF))
+          (setq i (+ i 3)))
+         ((and (>= b0 #xF0) (<= b0 #xF4)
+               (< (+ i 3) n)
+               (let ((b1 (aref string (1+ i))))
+                 (and (if (= b0 #xF0) (>= b1 #x90) (>= b1 #x80))
+                      (if (= b0 #xF4) (<= b1 #x8F) (<= b1 #xBF))))
+               (>= (aref string (+ i 2)) #x80)
+               (<= (aref string (+ i 2)) #xBF)
+               (>= (aref string (+ i 3)) #x80)
+               (<= (aref string (+ i 3)) #xBF))
+          (setq i (+ i 4)))
+         (t
+          (setq valid nil)))))
+    valid))
+
+(defun anvil-server--utf8-bytes-to-string (string)
+  "Decode unibyte UTF-8 STRING while preserving multibyte input."
+  (if (multibyte-string-p string)
+      string
+    (unless (anvil-server--valid-utf8-bytes-p string)
+      (signal 'json-error '("Invalid UTF-8 in JSON input")))
+    ;; Measured 2026-08-28 with UTF-8 bytes for "日本語": NeLisp
+    ;; v1.1.0+1 `string-as-multibyte' => (26085 26412 35486);
+    ;; Emacs 30.1 `decode-coding-string' => (26085 26412 35486).
+    (if (fboundp 'nelisp--write-stderr-line)
+        (string-as-multibyte string)
+      (decode-coding-string string 'utf-8 t))))
+
 (defun anvil-server-process-jsonrpc (json-string server-id)
   "Process a JSON-RPC message JSON-STRING for SERVER-ID and return the response.
 This is the main entry point for stdio transport in MCP.
@@ -2082,67 +2223,24 @@ See also: `anvil-server-process-jsonrpc-parsed'"
           (decoded nil))
       (condition-case json-err
           (progn
-            ;; Bypass decode-coding-string on standalone nelisp:
-            ;; read-stdin-bytes already returns a UTF-8 string, and
-            ;; decode-coding-string on it produces a multibyte string
-            ;; whose internal representation makes json-read-from-string
-            ;; pathologically slow (> 600 s observed for 150-byte body).
-            (setq decoded
-                  (if (fboundp 'nelisp--write-stderr-line)
-                      ;; Standalone nelisp: read-stdin-bytes already returns
-                      ;; UTF-8 text; decode-coding-string would make json-read
-                      ;; pathologically slow, so pass through unchanged.
-                      json-string
-                    ;; Host Emacs: the JSON-RPC line arrives as a unibyte
-                    ;; (raw UTF-8 byte) string, so decode to multibyte before
-                    ;; json-read.  Otherwise CJK argument values come back
-                    ;; unibyte and `search-forward' / `re-search-forward'
-                    ;; never match the multibyte file buffer (manifested as
-                    ;; file-replace-string "string not found" on Japanese
-                    ;; while pure-ASCII args were unaffected).
-                    (if (and (fboundp 'multibyte-string-p)
-                             (multibyte-string-p json-string))
-                        json-string
-                      (decode-coding-string json-string 'utf-8 t))))
+            ;; NeLisp v1.1.0+1 measurement (2026-08-28): converting a
+            ;; 150-byte unibyte CJK JSON request with `string-as-multibyte'
+            ;; took 0.000012875 s and `json-read-from-string' then took
+            ;; 0.013195038 s.  The former >600 s pathology is gone.
+            ;; Emacs 30.1 measurement: searching a multibyte "日本語"
+            ;; buffer with its unibyte UTF-8 bytes returned nil; decoding
+            ;; the query first returned buffer position 4.
+            (setq decoded (anvil-server--utf8-bytes-to-string json-string))
             (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
                (format "[PJ] decode %.4fs decoded-len=%d"
                        (- (float-time) t0) (length decoded))))
-            ;; Standalone nelisp: json-read-from-string and string-match
-            ;; both return nil on raw-byte strings from read-stdin-bytes,
-            ;; so use a char-by-char scan that bypasses both.
-            ;; Host Emacs: json-read works fine and is needed because
-            ;; the scan-extract path drops `params' (real tool dispatch
-            ;; needs full alist).  Gate on a standalone-only fboundp.
             (let ((t1 (float-time)))
-              (if (fboundp 'nelisp--write-stderr-line)
-                  ;; standalone path
-                  (let* ((sx-id (anvil-server--scan-json-value-after
-                                 decoded "\"id\":"))
-                         (sx-method (anvil-server--scan-string-after
-                                     decoded "\"method\":"))
-                         ;; For `tools/call' the handler needs
-                         ;; `(name . X) (arguments . ALIST)' in params.
-                         ;; Extract both with a flat-object scanner.
-                         (sx-params
-                          (when (equal sx-method "tools/call")
-                            (let ((nm (anvil-server--scan-string-after
-                                       decoded "\"name\":"))
-                                  (args (anvil-server--scan-flat-object-after
-                                         decoded "\"arguments\":")))
-                              `((name . ,nm) (arguments . ,args))))))
-                    (setq json-object
-                          `((jsonrpc . "2.0")
-                            (id . ,sx-id)
-                            (method . ,sx-method)
-                            (params . ,sx-params)))
-                    (when anvil-server--debug-trace
-                      (nelisp--write-stderr-line
-                       (format "[PJ] scan-extract %.4fs id=%S method=%S name=%S"
-                               (- (float-time) t1) sx-id sx-method
-                               (and sx-params (alist-get 'name sx-params))))))
-                ;; host Emacs path — normal json-read
-                (setq json-object (json-read-from-string decoded)))))
+              (setq json-object (json-read-from-string decoded))
+              (when (and anvil-server--debug-trace
+                         (fboundp 'nelisp--write-stderr-line))
+                (nelisp--write-stderr-line
+                 (format "[PJ] json-read %.4fs" (- (float-time) t1))))))
         (json-error
          (setq response
                (anvil-server--jsonrpc-error
@@ -2227,12 +2325,12 @@ characters report the correct on-the-wire byte count.
 Raises `wrong-type-argument' if JSON-STRING is not a string."
   (unless (stringp json-string)
     (signal 'wrong-type-argument (list 'stringp json-string)))
-  (let* ((body (encode-coding-string json-string 'utf-8 t))
+  (let* ((body (anvil-server--string-to-utf8-bytes json-string))
          (n (length body))
          (header (format "%s: %d\r\n\r\n"
                          anvil-server-mcp-framing-header-name n)))
     ;; Header is ASCII, body is already a unibyte UTF-8 string.
-    (concat (encode-coding-string header 'utf-8 t) body)))
+    (concat (anvil-server--string-to-utf8-bytes header) body)))
 
 (defun anvil-server-mcp-parse-content-length-header (header-block)
   "Parse HEADER-BLOCK and return the Content-Length integer or nil.
@@ -2262,9 +2360,7 @@ Signals an error tagged `anvil-mcp-frame-error' on malformed
 framing (e.g. missing Content-Length header)."
   (unless (stringp input)
     (signal 'wrong-type-argument (list 'stringp input)))
-  (let* ((unibyte (if (multibyte-string-p input)
-                      (encode-coding-string input 'utf-8 t)
-                    input))
+  (let* ((unibyte (anvil-server--string-to-utf8-bytes input))
          ;; \r\n\r\n separator between header section and body.
          (sep "\r\n\r\n")
          (sep-pos (string-match (regexp-quote sep) unibyte)))
@@ -2288,12 +2384,12 @@ framing (e.g. missing Content-Length header)."
          (t
           (let* ((body-bytes (substring unibyte body-start
                                         (+ body-start n)))
-                 (body (decode-coding-string body-bytes 'utf-8 t))
+                 (body (anvil-server--utf8-bytes-to-string body-bytes))
                  (consumed (+ body-start n)))
             (list :body body :consumed consumed)))))))))
 
 (define-error 'anvil-mcp-frame-error
-  "Malformed MCP Content-Length framing")
+              "Malformed MCP Content-Length framing")
 
 (defun anvil-server-mcp-detect-framing-p (initial)
   "Return non-nil if INITIAL bytes look like MCP Content-Length framing.
@@ -2450,11 +2546,11 @@ See also:
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line (concat "[REG-IN] " id)))
     (if-let* ((existing (gethash id tools-table)))
-      (if (plist-get existing :lazy-placeholder)
-          (progn
-            (remhash id tools-table)
-            (apply #'anvil-server-register-tool handler properties))
-        (anvil-server--ref-counted-register id existing tools-table))
+        (if (plist-get existing :lazy-placeholder)
+            (progn
+              (remhash id tools-table)
+              (apply #'anvil-server-register-tool handler properties))
+          (anvil-server--ref-counted-register id existing tools-table))
       (let* ((_p1 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-1 normalize] " id))))
              (handler-meta
@@ -2672,44 +2768,44 @@ Supports RFC 6570 simple variables {var} and reserved expansion {+var}."
         (len (length template)))
     ;; Process template character by character
     (while (< pos len)
-      (if-let ((var-start (string-match "{" template pos)))
-        ;; Found variable start
-        (progn
-          ;; Add literal segment before variable if any
-          (when (> var-start pos)
-            (push (list
-                   :type 'literal
-                   :value (substring template pos var-start))
-                  segments))
-          ;; Find variable end (guaranteed to exist due to balance check)
-          (let* ((var-end (string-match "}" template var-start))
-                 ;; Extract variable content
-                 (var-content
-                  (substring template (1+ var-start) var-end))
-                 (reserved
-                  (and (> (length var-content) 0)
-                       (eq (aref var-content 0) ?+)))
-                 (var-name
-                  (if reserved
-                      (substring var-content 1)
-                    var-content)))
-            ;; Validate variable name
-            ;; RFC 6570: Variable names must start with ALPHA / "_"
-            ;; and contain only ALPHA / DIGIT / "_" / pct-encoded
-            (unless (string-match-p
-                     "\\`[A-Za-z_][A-Za-z0-9_]*\\'" var-name)
-              (error
-               "Invalid variable name '%s' in resource template: %s"
-               var-name
-               template))
-            ;; Add variable segment
-            (push (list
-                   :type 'variable
-                   :name var-name
-                   :reserved reserved)
-                  segments)
-            (push var-name variables)
-            (setq pos (1+ var-end))))
+      (if-let* ((var-start (string-match "{" template pos)))
+          ;; Found variable start
+          (progn
+            ;; Add literal segment before variable if any
+            (when (> var-start pos)
+              (push (list
+                     :type 'literal
+                     :value (substring template pos var-start))
+                    segments))
+            ;; Find variable end (guaranteed to exist due to balance check)
+            (let* ((var-end (string-match "}" template var-start))
+                   ;; Extract variable content
+                   (var-content
+                    (substring template (1+ var-start) var-end))
+                   (reserved
+                    (and (> (length var-content) 0)
+                         (eq (aref var-content 0) ?+)))
+                   (var-name
+                    (if reserved
+                        (substring var-content 1)
+                      var-content)))
+              ;; Validate variable name
+              ;; RFC 6570: Variable names must start with ALPHA / "_"
+              ;; and contain only ALPHA / DIGIT / "_" / pct-encoded
+              (unless (string-match-p
+                       "\\`[A-Za-z_][A-Za-z0-9_]*\\'" var-name)
+                (error
+                 "Invalid variable name '%s' in resource template: %s"
+                 var-name
+                 template))
+              ;; Add variable segment
+              (push (list
+                     :type 'variable
+                     :name var-name
+                     :reserved reserved)
+                    segments)
+              (push var-name variables)
+              (setq pos (1+ var-end))))
         ;; No more variables, add remaining literal
         (when (< pos len)
           (push (list :type 'literal :value (substring template pos))
@@ -2740,7 +2836,7 @@ EXTRA-PROPS is a plist of additional properties to include (e.g., :parsed)."
       (error "Resource registration requires :name property"))
 
     (if-let* ((existing (gethash uri hash-table)))
-      (anvil-server--ref-counted-register uri existing hash-table)
+        (anvil-server--ref-counted-register uri existing hash-table)
       (let ((entry
              (append (list :handler handler :name name) extra-props)))
         (when description

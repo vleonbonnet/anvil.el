@@ -110,7 +110,10 @@ Legacy responses are emitted as a single line terminated by `terpri'."
         (let ((coding-system-for-write 'utf-8))
           (anvil-server--batch-write-stdout frame))))
      (t
-      (anvil-server--batch-write-stdout (concat resp "\n"))))))
+      ;; MCP stdio is UTF-8 on every platform.  In particular, native
+      ;; Windows Emacs otherwise writes non-ASCII characters as CP932.
+      (let ((coding-system-for-write 'utf-8))
+        (anvil-server--batch-write-stdout (concat resp "\n")))))))
 
 (defun anvil-server--batch-skip-blank-lines ()
   "Drain consecutive blank lines from STDIN and return next non-blank.
@@ -316,6 +319,16 @@ tolerate CRLF expansion under `--batch' line-based stdin reads."
                       (setq need 0))))))))
           (and (not (string-empty-p acc)) acc))))))
 
+(defun anvil-server--stage-d-env-optional-modules ()
+  "Return optional modules requested through `ANVIL_OPTIONAL_MODULES'."
+  (let ((raw (getenv "ANVIL_OPTIONAL_MODULES"))
+        modules)
+    (when raw
+      (dolist (part (split-string raw "[,[:space:]]+" t))
+        (when (string-match-p "\\`[A-Za-z0-9_-]+\\'" part)
+          (push (intern part) modules))))
+    (nreverse modules)))
+
 ;;;###autoload
 (defun anvil-server-stage-d-headless-run ()
   "Stage D launcher entry: load anvil + headless profile, run batch stdio.
@@ -342,7 +355,8 @@ Stage D distribution.  Equivalent shell invocation:
   ;; from the headless launcher's first invocation (Doc 29 Phase 5 +
   ;; Doc 42 Phase 2).
   (when (boundp 'anvil-optional-modules)
-    (dolist (m '(http state memory worklog))
+    (dolist (m (append (anvil-server--stage-d-env-optional-modules)
+                       '(http state memory worklog)))
       (cl-pushnew m anvil-optional-modules)))
   (when (fboundp 'anvil-enable)
     (anvil-enable))

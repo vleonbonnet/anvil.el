@@ -23,19 +23,62 @@ run elisp, query SQLite, and more *through Emacs primitives* instead
 of generic =sed= / =grep= / =read-whole-file= round-trips.  That
 swap is where the token savings come from.
 
-v1.3.0 turns the 2026-05/06 develop line into a release: codebase
-graph analysis in =anvil-defs=, structured mail tools for mu4e and
-Wanderlust/Maildir, CAD DXF/SVG read/edit tools, fusion/long-run
-evaluation helpers, and Headroom-style reversible context compression.
-The older v1.0 architecture milestone still matters: anvil can run
-through a normal Emacs daemon or through the NeLisp standalone runtime.
+v1.4.1 (2026-10-04) adds bounded handling for
+selected file reads and successful inline results, bounded diagnostic and
+telemetry traversal, and safer worker cleanup after successful termination.
+These changes build on the v1.4.0 feature set: searchable Claude Code session
+events and PreCompact reference snapshots, in-place memory updates, stateless
+MCP requests, worker deadlines, a NeLisp v1.2.0 standalone path, and expanded
+fusion capabilities. The Emacs daemon remains the full-featured path.
+
+v1.4.0 brought the develop line through 2026-10-03 to =master=. It adds
+searchable Claude Code session events and PreCompact reference
+snapshots, in-place memory updates, stateless MCP requests, worker
+deadlines and timeout cleanup, and a NeLisp v1.2.0 standalone path
+with a TCP daemon and optional database-backed tools. Fusion gains
+Sonnet-solo, multi-round critique, and calibration reports that propose
+changes for review.
+The v1.3.0 mail, CAD, code graph, and context tools remain available;
+the Emacs daemon remains the full-featured path.
 
 [[file:STORY.org][STORY.org]] ([[file:STORY.ja.org][日本語]]) tells the longer "why this exists" story.
 
 * Current Release Highlights
 
-The 2026-07 wave (post-v1.3.0, on master) adds a verified fusion stack
-and a measured token-thrift layer — usage guide: [[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]]:
+Release v1.4.1 (2026-10-04) adds bounded handling for file reads, successful inline results,
+diagnostic snapshots, and telemetry rendering, plus safer worker cleanup.
+The byte limits apply at their documented boundaries; they do not bound
+arbitrary execution or complete transport frames. The v1.4.0 feature baseline
+and July master wave remain available below.
+
+| Area | What changed |
+|------+--------------|
+| File reads | Default 1 MiB cap on selected raw bytes; pagination reads bounded chunks. Nil or non-positive legacy settings retain prior behavior. |
+| Inline results | Default 2 MiB budget for projected escaped UTF-8 JSON-string bytes on normalized successful results, checked before and after disclosure. Execution, result construction, error paths, and full frames are outside this limit. |
+| Diagnostics and telemetry | Finite traversal, depth, and leaf budgets apply before formatting. Raw tool-error snapshots are shared with telemetry; ordinary codes and metrics are preserved. Other error and transport paths are not all bounded. |
+| Worker cleanup | After a successful kill request, all identically owned slots are detached synchronously, without waiting for the sentinel. Kill errors preserve ownership; raw-response and pool diagnostics are retained. |
+
+For larger file reads, pass =offset="0"= and =limit="200"=, reducing the limit
+if the selected page is too large. Use paginated, filtered, tee, or asynchronous
+interfaces for larger results. Set =anvil-file-max-inline-read-bytes= or
+=anvil-server-max-inline-result-bytes= to nil or a non-positive integer only
+to restore the corresponding legacy behavior; other error and transport paths
+are not all bounded.
+
+Previous release: v1.4.0 includes the July master wave and the subsequent
+develop work through 2026-10-03. The July fusion guide is at
+[[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]]. New develop additions include:
+
+| Area | What changed |
+|------+--------------|
+| Session recall | When enabled, =session-events-search-ranked= searches Claude Code events indexed with FTS5 and a CJK fallback (for example, ={"query":"release","limit":5}=). Hooks merge safely, and PreCompact can retain a reference snapshot for restoration. |
+| NeLisp runtime | The standalone launcher follows NeLisp v1.2.0, supports NDJSON and Content-Length MCP framing, cache prewarming, and a TCP loopback daemon. It requires matching NeLisp and =nelisp-emacs-lib= revisions; SQLite-backed tools also need the dynamic reader. Windows TCP and macOS standalone operation are unverified. |
+| MCP and memory | The server accepts the 2026-07-28 stateless request form alongside initialize-based clients. Memory adds in-place updates and transactional scan handling. |
+| Worker and process control | Workers share a deadline budget; stdio process groups are cleaned up on timeout. Evaluation results and errors are bounded before returning to clients. |
+| Fusion | Adds Sonnet-solo panels, agentic member permission passthrough, deeper multi-round critique, and router calibration reports that propose changes without applying them. |
+| Mail and CAD | Wanderlust adds OAuth, Graph sync, and local filters; CAD adds standalone SVG fast paths and native file I/O. |
+
+The July master wave, also included in this release:
 
 | Area | What changed |
 |------+--------------|
@@ -45,6 +88,11 @@ and a measured token-thrift layer — usage guide: [[file:docs/FUSION-GUIDE.org]
 | Plan fusion + agentic long-runs | =anvil-fusion-plan= merges implementation plans with repo-reality checks (files/APIs named by a plan must exist); long-run quests can execute distiller-flagged hard steps as panels (=:step-panel=) with a claim-verification gate between steps (=:verify-steps=). |
 | Trajectory library | =anvil-fusion-traj= stores verified wins (admission gate: ≥1 confirmed claim, zero refuted) and prepends retrieved exemplars to future panel prompts — self-improvement without weight updates. |
 | Token thrift (measured) | Per-tool volume telemetry (=metrics-token-report=), distilled test runs (=ert-run-distilled=, ~120-char results), diff-first re-reads (=file-read-delta=, ~126x smaller re-reads), search snippet clamps (~87% smaller), verdict cache + sequential skeptics, judge-input dedup, and an opt-in response budget with continuation fetch (=disclosure-fetch=). |
+
+These benchmark figures describe specific fixtures, not a general completion
+gain. Later coding fixtures were saturated; coding completion uplift remains
+unproven. A six-question KB benchmark improved the strong tier from 0.50 to
+0.60, while the weak tier declined from 0.40 to 0.37.
 
 v1.3.0 highlights (previous wave):
 
@@ -92,16 +140,16 @@ A typical refactoring session saves *15,000-25,000 tokens*.
        └────┬─────────────────┬───┘
             │                 │
    ┌────────▼─────────┐ ┌─────▼──────────────┐
-   │ Running Emacs    │ │ NeLisp (Rust)      │
-   │ daemon           │ │ no-Emacs runtime   │
-   │ (default path)   │ │ (--no-emacs flag)  │
+   │ Running Emacs    │ │ NeLisp v1.2.0      │
+   │ daemon           │ │ standalone reader  │
+   │ (full feature set)│ │ (selected modules) │
    └──────────────────┘ └────────────────────┘
 #+end_example
 
 The AI client speaks MCP to anvil.el.  anvil.el dispatches to a
 running Emacs daemon (default — full feature set) or to the NeLisp
-Rust runtime (=--no-emacs= path — smaller surface, no Emacs install
-needed).
+standalone reader through =bin/anvil-runtime= (selected modules, no
+Emacs install needed).
 
 * Components
 
@@ -113,40 +161,47 @@ small and has its own release cadence:
 | [[https://github.com/zawatton/anvil.el][anvil.el]]      | The AI brain — MCP server, ~40 tools by default (each optional module adds its own) | yes |
 | [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]]  | Human IDE layer — treesit nav, dashboard, info-look | optional, Emacs users |
 | [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]     | Nix-backed pkg manager — lets the AI install its own dependencies | optional |
-| [[https://github.com/zawatton/nelisp][NeLisp]]        | Rust runtime — runs Elisp without Emacs | optional, =--no-emacs= path |
+| [[https://github.com/zawatton/nelisp][NeLisp]]        | Standalone reader — runs Elisp without Emacs | optional, =bin/anvil-runtime= path |
 
 * Installation
 
 Pick a path based on what you want.
 
-** Path A — no Emacs install required (NeLisp Rust runtime)
+** Path A — no Emacs install required (NeLisp standalone runtime)
 
 For users who want the MCP tool surface without an Emacs daemon —
 CI runners, ephemeral containers, or "I don't use Emacs but want to
 cut Claude Code / Codex CLI token use."
 
+Build the NeLisp v1.2.0 standalone reader and use the matching
+=nelisp-emacs-lib= checkout as described in the [[https://github.com/zawatton/nelisp][NeLisp setup guide]].
+To expose SQLite-backed tools, build the dynamic reader with
+=NELISP_READER_DYNAMIC=1 make standalone-reader=. From an =anvil.el=
+checkout, inspect the resolved runtime with =bin/anvil-runtime doctor=,
+prepare its schema and tool caches with =bin/anvil-runtime prewarm=, then
+serve MCP with =bin/anvil-runtime mcp serve=. The exact tools depend on
+the selected modules; SQLite-backed memory and worklog tools require the
+dynamic reader and their modules to be enabled. Use matching NeLisp and
+=nelisp-emacs-lib= revisions. Linux DB-backed use was exercised under
+WSL and Windows stdio was exercised; Windows TCP and macOS standalone
+operation are unverified. Isolated Linux SQLite queries were verified with
+both framing modes, including ordered row truncation. Backends without a
+working native cursor use a compatibility cursor that materializes the
+query result; the response row cap does not bound database reads or memory
+use. Working native cursors retain their streaming behavior.
+
+For example, enable the database-backed set before prewarming and
+serving:
+
 #+begin_src bash
-# 1. Clone NeLisp + build the Rust runtime
-git clone https://github.com/zawatton/nelisp.git
-cd nelisp/nelisp-runtime
-cargo build --release
-cd ../..
-
-# 2. Clone anvil.el (provides the Elisp source loaded by the runtime)
-git clone https://github.com/zawatton/anvil.el.git
-
-# 3. Run the MCP server (no Emacs daemon spawned)
-ANVIL_EL_DIR="$(pwd)/anvil.el" \
-  ./nelisp/bin/anvil mcp serve --no-emacs
+export ANVIL_TOOL_MODULES=anvil-discovery,anvil-sqlite,anvil-bench,anvil-state,anvil-memory,anvil-worklog
+bin/anvil-runtime prewarm
+bin/anvil-runtime mcp serve
 #+end_src
-
-The Rust binary reads + evaluates Elisp itself; the Emacs C core is
-not invoked.  Surface today via this path: =file-*= / =shell-*= /
-=data-*= / =anvil-host-*= / =directory-list= (42 tools).
 
 ** Path B — Emacs integrated (recommended for Emacs users)
 
-For day-to-day Emacs users.  Pin to v1.3.0 via your favourite
+For day-to-day Emacs users. Pin to v1.4.1 via your favourite
 package manager.
 
 *** Quick install (one command)
@@ -172,17 +227,17 @@ installed.
 #+begin_src emacs-lisp
 ;; async-installer
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                         :tag "v1.3.0"
+                         :tag "v1.4.1"
                          :main "anvil.el")
 
 ;; or straight.el
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v1.3.0"))
+         :branch "v1.4.1"))
 
 ;; or elpaca
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v1.3.0"))
+               :ref "v1.4.1"))
 #+end_src
 
 After installing:
@@ -244,8 +299,8 @@ Full walkthrough including Claude Code / Claude Desktop config:
   buffer state, not whole files
 - *Multi-agent coordination* — fan out to five AI CLIs in parallel
   with consensus and a meta-LLM judge, all from inside Emacs
-- *Safe by design* — long-running tasks dispatched to a background
-  Emacs, so the interactive Emacs is never blocked
+- *Safe by design* — long-running tasks run in a worker Emacs under
+  a shared deadline; timed-out processes are cleaned up
 - *Org-mode native* — first-class org read / write / refactor
 - *Large file safe* — handles 1.2 MB+ files without truncation
 - *Cross-platform* — Linux, macOS, Windows, WSL
@@ -269,8 +324,8 @@ You don't have to open an Emacs window or write =init.el=.
 
 - *15-30 minutes of first-time setup* on Path B (install Emacs,
   clone anvil, wire up MCP) — or zero on Path A (no Emacs at all)
-- *Resident memory* — Path B keeps an Emacs daemon at ~50-200 MB
-  idle; Path A's Rust runtime stays under ~50 MB
+- *Resident memory* — Path B keeps an Emacs daemon running;
+  Path A's footprint depends on the selected NeLisp modules
 - *One more dependency to maintain* — Emacs updates and OS
   migrations include it (Path B only)
 
@@ -286,7 +341,7 @@ sister package).  Highlights:
 
 | Capability | What it does |
 |------------+--------------|
-| =bin/anvil mcp serve --no-emacs= (v1.0) | *Standalone path — no Emacs install required.*  The =anvil-runtime= Rust binary reads + evaluates Elisp and serves anvil's MCP tools over stdio.  Existing Emacs users keep =bin/anvil mcp serve= unchanged |
+| =bin/anvil-runtime mcp serve= (v1.0+) | *Standalone path — no Emacs install required.* The NeLisp v1.2.0 reader evaluates Elisp and serves selected Anvil tools over MCP. Use =doctor= and =prewarm= to inspect and prepare the runtime; SQLite-backed tools require the dynamic reader and enabled modules. |
 | =anvil-pkg= (v1.0) | Elisp-DSL package manager backed by the Nix store.  =(pkg-install "ripgrep")= for nixpkgs attributes; =(pkg-define …)= macro for custom builds (=stdenv= / =rust= / =python= / =go= / =emacs-package= build systems).  Same idea as Guix in Scheme — but in Elisp, integrated with anvil's MCP surface so an AI agent can install its own dependencies in one Lisp form.  Lives in [[https://github.com/zawatton/anvil-pkg][zawatton/anvil-pkg]] |
 | =anvil-ide.el= split (v1.0) | Emacs-only IDE layer (treesit nav, =worker-ui= dashboard, =info-lookup-symbol=) moved out to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].  Install both for the original feature set; install only =anvil.el= if you want the AI-side workbench without the human IDE surface |
 | Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G — =anvil-ts= / =-js= / =-py= structural ops keep working on hosts without an Emacs tree-sitter (e.g. NeLisp standalone) via Python =ast= / acorn subprocess fallback.  Token-efficient AST queries preserved on the Rust substrate |
@@ -308,7 +363,7 @@ sister package).  Highlights:
 | =anvil-shell-filter= (v0.4.0) | Shell output compression — 20 bundled filters for git / rg / pytest / ert-batch / docker-logs etc.  Raw output stashed with TTL so callers can still recover full text when needed |
 | =file-batch= | Apply multiple edits to the same file atomically in one round trip (up to ~90% token reduction) |
 | =org-read-outline= / =org-read-headline= | Read just the headings or a single subtree, even on a 13,000-line org. No full-file read needed |
-| =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
+| =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate worker Emacs with a shared deadline budget and timeout cleanup |
 | Large org file editing | Edit org files of 1.2 MB or more without truncation (avoids the Windows file-mount issue) |
 | LLM client agnostic | Claude Code / Codex CLI / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
 | =anvil-modes-allow-buffer-modify= | Configure major modes where Anvil tools modify live buffers directly rather than visiting files, preserving unsaved changes. |
@@ -423,6 +478,49 @@ For org-mode refactors specifically, MCP-backed operations
 (section move, refile, split) run *10–20× cheaper in tokens* than
 their Read + Write equivalents.
 
+In v1.4.1, =file-read= defaults to a 1 MiB raw-byte cap.
+For larger files, pass =offset="0"= and =limit="200"=; reduce the limit
+if the selected page also exceeds the cap. Pagination uses bounded chunks
+and retains only the selected page. Preserving automatic line-ending
+detection may require an additional bounded scan; exact =:total-lines=
+still needs a complete scan. The cap does not bound encoded MCP response size or scan
+time. Set =anvil-file-max-inline-read-bytes= to nil, zero or a negative
+integer only when explicitly choosing legacy full-file reads.
+
+Successful inline tool-result text also defaults to a 2 MiB limit after
+projecting UTF-8 JSON string escaping, excluding surrounding quotes. The
+server checks normalized results before and after disclosure processing;
+oversized content is replaced with a fixed error before payload telemetry.
+Use paginated, filtered, tee or asynchronous interfaces for larger results.
+Set =anvil-server-max-inline-result-bytes= to nil or a non-positive integer
+to explicitly restore legacy behavior. The cap applies to successful text;
+its fixed rejection diagnostic has a separate bound, and existing error
+paths and complete response frames are outside it. Tool execution and rich
+result normalization can still allocate large values before this check.
+
+Automatic harness failure telemetry also bounds error data before rendering.
+It limits visited elements, nesting and characters. Oversized data is truncated
+or replaced; cyclic or opaque values use omission markers. Stored error
+messages default to 4,096 characters and raw context to 500; configure
+=anvil-harness-telemetry-error-message-max-chars= and
+=anvil-harness-telemetry-raw-context-max-chars= for smaller fields. Zero keeps
+the field empty, invalid settings use finite defaults, and larger settings
+are clamped to 4,096 characters. Classification uses bounded message text and
+retains the existing rule order. This applies to automatic error recording;
+direct manual recording, other server error paths and cancellation remain
+separate.
+
+Raw errors caught by =anvil-server-with-error-handling= are also copied before
+printing: at most 512 visited values, depth 8 and 4,096 leaf characters.
+Large strings are truncated; cyclic or opaque values use omission markers.
+The pure snapshot implementation is shared with telemetry. The existing
+=anvil-server-tool-error-max-chars= setting controls final text truncation;
+setting it to nil disables that final cap while the independent data-copy
+limits remain finite. Small ordinary =Error: ...= messages retain their text.
+Generic server error formatting, explicit tool-throw text, lazy loaders,
+quit/invalid-parameter/not-found responses and transport containment remain
+separate.
+
 ** Batch edits into one round trip
 
 When an agent makes several edits to the same file, each becomes a
@@ -475,29 +573,16 @@ regex scanners, so heading lookups and outline reads stay fast on
 multi-megabyte org trees (the kind of monolithic =init.org= or
 journal file power users actually maintain).
 
-** Standalone runtime — no Emacs daemon startup cost (v1.0)
+** Standalone runtime — selected tools without an Emacs daemon (v1.4.0)
 
-NeLisp Doc 44 ships =bin/anvil mcp serve --no-emacs=, which spawns
-the =anvil-runtime= Rust binary instead of an Emacs daemon.  For
-short-lived MCP sessions (CI runs, one-shot agent dispatches,
-ephemeral containers), this skips Emacs's daemon cold-start
-entirely and keeps the resident process much smaller than a
-fully-loaded Emacs daemon.
+=bin/anvil-runtime mcp serve= uses the NeLisp reader without starting an
+Emacs daemon. Its tool surface depends on enabled modules and the matching
+NeLisp / =nelisp-emacs-lib= revisions. SQLite-backed modules require the
+dynamic reader. Run =doctor= and =prewarm= as described in Path A above,
+then inspect =tools/list= for the available tools. Full Emacs and IDE
+coverage is not implied by standalone support.
 
-Architecture α (anvil-http / anvil-state / anvil-defs /
-anvil-org-index delegating their core helpers to NeLisp via
-=fboundp= guard + fallback) makes the same MCP tool surface
-reachable from either substrate:
-
-| Deployment    | Tool surface                                    |
-|---------------+--------------------------------------------------|
-| Bundled-Emacs | full =anvil.el= + =anvil-ide.el=                |
-| Rust-only     | full =anvil.el= (IDE via subprocess fallback)    |
-
-Existing Emacs users keep =bin/anvil mcp serve= as before.
-Containers / ephemeral runners / "I just want the AI workbench
-without learning Emacs" users get the same MCP tools through the
-Rust path with no =apt install emacs= step.
+Existing Emacs users can continue using =bin/anvil mcp serve=.
 
 ** Case study: TypeScript refactoring at scale
 
@@ -1630,6 +1715,9 @@ knowledge required to capture the AI-token savings.
 #+end_example
 
 * Platform Support
+
+The current CI matrix runs on GNU Emacs 31.1. The package metadata
+continues to declare its compatibility floor separately.
 
 | Platform             | Status    |
 |----------------------+-----------|

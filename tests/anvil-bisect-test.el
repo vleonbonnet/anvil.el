@@ -141,6 +141,13 @@ Returns (REPO :good-ref SHA :bad-ref SHA :break-sha SHA)."
   (should (fboundp 'anvil-bisect-enable))
   (should (fboundp 'anvil-bisect-disable)))
 
+(ert-deftest anvil-bisect-test-default-emacs-program-is-resolved ()
+  "The default subprocess executable is anchored to this Emacs binary."
+  (when (and invocation-name invocation-directory
+             (not (file-name-absolute-p invocation-name)))
+    (should (equal (expand-file-name invocation-name invocation-directory)
+                   (default-value 'anvil-bisect-emacs-program)))))
+
 
 ;;;; --- helper unit tests ----------------------------------------------
 
@@ -154,6 +161,51 @@ Returns (REPO :good-ref SHA :bad-ref SHA :break-sha SHA)."
               "# first bad commit: [abc123def456] BAD: off-by-one\n")))
     (should (equal "abc123def456"
                    (anvil-bisect--first-bad-sha log)))))
+
+(ert-deftest anvil-bisect-test-first-bad-sha-quoted-header ()
+  "Extract the terminal SHA from Git's quoted `first 'bad' commit' header."
+  (let ((log "# first 'bad' commit: [abc123def456] BAD: off-by-one\n"))
+    (should (equal "abc123def456"
+                   (anvil-bisect--first-bad-sha log)))))
+
+(ert-deftest anvil-bisect-test-terminal-first-bad-sha-formats ()
+  "Recognize both terminal header spellings, but not skipped candidates."
+  (dolist (header '("# first bad commit: [abc123def456] subject\n"
+                    "# first 'bad' commit: [abc123def456] subject\n"))
+    (should (equal "abc123def456"
+                   (anvil-bisect--terminal-first-bad-sha header))))
+  (dolist (candidate '("# possible first 'bad' commit: [abc123def456] subject\n"
+                       "# only skipped commits left to test\n# possible first bad commit: [abc123def456] subject\n"))
+    (should-not (anvil-bisect--terminal-first-bad-sha candidate))))
+
+(ert-deftest anvil-bisect-test-drive-waits-for-terminal-header ()
+  "The driver must continue past possible-first candidates and fallback SHAs."
+  (let* ((candidate-log
+          (concat "# bad: [aaaaaaaaaaaaaaaa] initial bad\n"
+                  "# bad: [bbbbbbbbbbbbbbbb] last tested bad\n"
+                  "# only skipped commits left to test\n"
+                  "# possible first 'bad' commit: [bbbbbbbbbbbbbbbb] candidate\n"))
+         (terminal-log "# first 'bad' commit: [cccccccccccccccc] actual result\n")
+         (logs (list candidate-log terminal-log terminal-log))
+         (steps 0)
+         result)
+    (cl-letf (((symbol-function 'anvil-bisect--git-check)
+               (lambda (&rest _args) t))
+              ((symbol-function 'anvil-bisect--run-step)
+               (lambda (&rest _args) (cl-incf steps) 'pass))
+              ((symbol-function 'anvil-bisect--collect-bisect-log)
+               (lambda (_worktree) (pop logs)))
+              ((symbol-function 'anvil-bisect--commit-metadata)
+               (lambda (&rest _args) '(:subject "actual result")))
+              ((symbol-function 'anvil-bisect--diff-files)
+               (lambda (&rest _args) nil)))
+      (setq result (anvil-bisect--drive
+                    "repo" "worktree" 'example-test "tests/example.el"
+                    "good" "bad" 5 1)))
+    (should (= steps 2))
+    (should (eq 'found (plist-get result :status)))
+    (should (equal "cccccccccccccccc"
+                   (plist-get result :breaking-sha)))))
 
 (ert-deftest anvil-bisect-test-commit-metadata-shape ()
   "anvil-bisect--commit-metadata returns the four documented keys."

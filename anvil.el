@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 1.3.0
+;; Version: 1.4.1
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
@@ -83,7 +83,10 @@ These are not loaded by default.  Available modules:
 - `org-index' — Persistent SQLite index of org files (requires Emacs 29+)
 - `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)
 - `dev'       — Developer helpers: `anvil-self-sync-check' for dev/installed
-                git HEAD mismatch detection
+                git HEAD mismatch detection, `anvil-codex-efficiency-check'
+                for Codex token-saving setup audits, and
+                `anvil-claude-limits-analyze' for Claude Code limits
+                report triage
 - `offload'   — Future-based API for running heavy elisp in a batch
                 subprocess (Doc 03 Phase 1)
 - `browser'   — agent-browser CLI wrapper: fetch / interact / capture
@@ -112,9 +115,9 @@ These are not loaded by default.  Available modules:
                 Claude Code's hardcoded ~83.5% auto-compact with a
                 user-tunable earlier trigger for long autonomous
                 sessions.  Requires `state' and integrates with
-                `session' (Stop event).  Five MCP tools: compact-
+                `session' (Stop event).  Seven MCP tools: compact-
                 estimate / -should-trigger / -snapshot / -restore /
-                -hook.
+                -hook / -stats / -pressure-report.
 - `harness-telemetry' — Doc 46 Phase 1 runtime-harness failure
                 classifier + 4-class SQLite telemetry (no-exec /
                 contract-violation / stall / reasoning).  Hooks
@@ -425,6 +428,15 @@ These are not loaded by default.  Available modules:
                 NeLisp execute path (Phase E), and ephemeral /
                 permanent promotion (Phase F) stay DRAFT until
                 Doc 35 reaches LOCKED.
+- `wl'        — Wanderlust-oriented Maildir tools.  Adds wl-search /
+                wl-list-mails / wl-read-mail / wl-compose-draft /
+                wl-send over a locally synced Maildir.  Install the
+                `wanderlust' package for its WL UI and FLIM/SEMI MIME
+                support; `bin/anvil emacs-package-install-wanderlust'
+                installs it into the package dir used by
+                `anvil mcp serve'.  Enable the tools with
+                `anvil mcp serve --module=wl' or
+                ANVIL_OPTIONAL_MODULES=wl.
 - `semantic'  — Local search over a configurable corpus of org / text
                 / code files, backed by built-in SQLite FTS5 (trigram
                 tokenizer for CJK substring matching).  Pure-Lisp and

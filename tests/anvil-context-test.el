@@ -3,8 +3,10 @@
 ;;; Code:
 
 (require 'ert)
+(require 'json)
 (require 'anvil-context)
 (require 'anvil-state)
+(require 'anvil-server-commands)
 
 (defmacro anvil-context-test--with-state (&rest body)
   "Run BODY with an isolated `anvil-state' DB."
@@ -80,6 +82,41 @@
       (should id)
       (should (equal raw (plist-get row :raw)))
       (should (eq 'log (plist-get row :kind))))))
+
+(ert-deftest anvil-context-test-mcp-retrieve-roundtrip-encodes-plist ()
+  "The registered retrieve tool returns its plist as MCP JSON text."
+  (anvil-context-test--with-state
+    (let ((anvil-context--server-id "anvil-context-test")
+          (was-running (anvil-server-running-p)))
+      (unwind-protect
+          (progn
+            (anvil-context-enable)
+            (unless was-running
+              (anvil-server-start))
+            (let* ((raw "original MCP context\n")
+                   (stored (anvil-context-compress raw :kind 'text :store t))
+                   (request
+                    (anvil-server-create-tools-call-request
+                     "context-retrieve" 1
+                     `(("ccr_id" . ,(plist-get stored :ccr-id)))))
+                   (response
+                    (anvil-server-process-jsonrpc-parsed
+                     request anvil-context--server-id))
+                   (result (alist-get 'result response))
+                   (content (aref (alist-get 'content result) 0))
+                   (payload (json-read-from-string
+                             (alist-get 'text content))))
+              (should-not (alist-get 'error response))
+              (should (equal "context-retrieve"
+                             (alist-get 'name
+                                        (alist-get 'params
+                                                   (json-read-from-string
+                                                    request)))))
+              (should (eq t (alist-get 'found payload)))
+              (should (equal raw (alist-get 'raw payload)))) )
+        (anvil-context-disable)
+        (unless was-running
+          (anvil-server-stop))))))
 
 (ert-deftest anvil-context-test-stats ()
   "Compression telemetry aggregates raw and compressed byte totals."

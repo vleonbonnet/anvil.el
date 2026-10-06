@@ -421,10 +421,13 @@ filesystem primitive is available."
 ;; --- sqlite FFI wire-up via emacs-sqlite-ffi + vendor sqlite.el ------
 
 ;; Standalone NeLisp ships:
-;;   - `emacs-sqlite-ffi.el' (in nelisp-emacs/src/) — uses the in-process
-;;     `nl-ffi-call' primitive against `libnelisp_runtime.so' to provide
-;;     real `sqlite-available-p' / `sqlite-open' / `sqlite-close' /
-;;     `sqlite-execute' / `sqlite-select' / `sqlitep' implementations.
+;;   - `emacs-sqlite-ffi.el' (in nelisp-emacs/src/) — since 2026-09-04
+;;     (NeLisp v1.2.0 + Doc 138 SQLite arm) builds the Emacs `sqlite-*'
+;;     API on the reader's name-dispatch `nl-ffi-call' sqlite3 rows
+;;     (winsqlite3.dll on windows-x86_64, libsqlite3.so.0 on the dynamic
+;;     Linux reader), including a real `set' cursor with
+;;     `sqlite-next' / `sqlite-more-p' / `sqlite-finalize'.  Before
+;;     that it spoke to the retired `libnelisp_runtime.so'.
 ;;   - `vendor/emacs-lisp/sqlite.el' — upstream Emacs sqlite.el, ships
 ;;     the `with-sqlite-transaction' macro and `(provide 'sqlite)' so
 ;;     `(require 'sqlite)' from anvil-* downstreams resolves.
@@ -497,57 +500,120 @@ filesystem primitive is available."
 ;;       (let ((row (sqlite-next stmt))) ...))
 ;;     (when stmt (sqlite-finalize stmt)))
 ;;
-;; emacs-sqlite-ffi.el's `sqlite-select' returns the full row list
-;; directly regardless of RETURN-TYPE.  We capture that FFI implementation
-;; into a defvar (= done AFTER the require above runs), then redefine
-;; `sqlite-select' with a cursor-aware wrapper that delegates to the
-;; captured FFI function and tags the row list as a
-;; `(:anvil-sqlite-cursor . REMAINING-ROWS)' cons when RETURN-TYPE is
-;; `set' or `full'.
+;; Some native adapters implement more-p/next/finalize but reject the
+;; `'set' return type. Probe a tiny in-memory database before deciding:
+;; only a working default query plus a failed cursor protocol justifies
+;; this list-backed compatibility path. It buffers every row in memory.
+(defvar anvil-runtime-polyfills--sqlite-native-select
+  (and (fboundp 'sqlite-select)
+       (symbol-function 'sqlite-select))
+  "Original native sqlite-select, captured once to make reload safe.")
+(defvar anvil-runtime-polyfills--sqlite-native-more
+  (and (fboundp 'sqlite-more-p) (symbol-function 'sqlite-more-p)))
+(defvar anvil-runtime-polyfills--sqlite-native-next
+  (and (fboundp 'sqlite-next) (symbol-function 'sqlite-next)))
+(defvar anvil-runtime-polyfills--sqlite-native-finalize
+  (and (fboundp 'sqlite-finalize) (symbol-function 'sqlite-finalize)))
+(defvar anvil-runtime-polyfills--sqlite-needs-set-polyfill nil)
 
-(defvar anvil-runtime-polyfills--sqlite-select-impl
-  (and (fboundp 'sqlite-select) (symbol-function 'sqlite-select))
-  "Captured emacs-sqlite-ffi `sqlite-select' implementation.
-Used by the cursor-aware override below so the wrapper delegates
-to the real FFI without infinite recursion.")
+(defun anvil-runtime-polyfills--sqlite-cursor-capable-p ()
+  "Check native default SELECT and two-row cursor behavior safely."
+  (when (and anvil-runtime-polyfills--sqlite-native-select
+             (fboundp 'sqlite-open) (fboundp 'sqlite-close))
+    (let (db stmt (ok nil))
+      (unwind-protect
+          (condition-case nil
+              (progn
+                (setq db (sqlite-open ":memory:"))
+                (when (equal (funcall anvil-runtime-polyfills--sqlite-native-select
+                                     db "SELECT 1 UNION ALL SELECT 2")
+                             '((1) (2)))
+                  (setq ok 'fallback)
+                  (when (and anvil-runtime-polyfills--sqlite-native-more
+                             anvil-runtime-polyfills--sqlite-native-next
+                             anvil-runtime-polyfills--sqlite-native-finalize)
+                    (setq stmt
+                          (funcall anvil-runtime-polyfills--sqlite-native-select
+                                   db "SELECT 1 UNION ALL SELECT 2" nil 'set)))
+                  (when (and stmt
+                             anvil-runtime-polyfills--sqlite-native-more
+                             (funcall anvil-runtime-polyfills--sqlite-native-more stmt)
+                             anvil-runtime-polyfills--sqlite-native-next
+                             (equal (funcall anvil-runtime-polyfills--sqlite-native-next stmt) '(1))
+                             anvil-runtime-polyfills--sqlite-native-more
+                             (funcall anvil-runtime-polyfills--sqlite-native-more stmt)
+                             anvil-runtime-polyfills--sqlite-native-next
+                             (equal (funcall anvil-runtime-polyfills--sqlite-native-next stmt) '(2))
+                             anvil-runtime-polyfills--sqlite-native-more
+                             (not (funcall anvil-runtime-polyfills--sqlite-native-more stmt)))
+                    ;; A cursor is compatible only if it also finalizes.
+                    (funcall anvil-runtime-polyfills--sqlite-native-finalize stmt)
+                    (setq stmt nil)
+                    (setq ok 'cursor))))
+            (error nil))
+        (when stmt (ignore-errors
+                     (funcall anvil-runtime-polyfills--sqlite-native-finalize stmt)))
+        (when db (ignore-errors (sqlite-close db))))
+      ok)))
 
-(when anvil-runtime-polyfills--sqlite-select-impl
+(setq anvil-runtime-polyfills--sqlite-needs-set-polyfill
+      (and anvil-runtime-polyfills--sqlite-native-select
+           (eq (anvil-runtime-polyfills--sqlite-cursor-capable-p) 'fallback)))
+
+(when anvil-runtime-polyfills--sqlite-needs-set-polyfill
   (defun sqlite-select (db query &optional values return-type)
-    "Cursor-aware override delegating to the captured FFI `sqlite-select'.
-When RETURN-TYPE is `'set' or `'full', wrap the row list as a
-`(:anvil-sqlite-cursor . REMAINING-ROWS)' cons.  Otherwise return
-rows inline (= matches the Emacs 30 builtin's default shape)."
-    (let ((rows (funcall anvil-runtime-polyfills--sqlite-select-impl
-                         db query values return-type)))
-      (cond
-       ((memq return-type '(set full))
-        (cons :anvil-sqlite-cursor (or rows nil)))
-       (t rows)))))
+    "Adapt only unsupported `'set' queries to a tagged list cursor.
+Other return types retain the native adapter's exact behavior."
+    (if (eq return-type 'set)
+        (cons :anvil-sqlite-cursor
+              (funcall anvil-runtime-polyfills--sqlite-native-select
+                       db query values))
+      (funcall anvil-runtime-polyfills--sqlite-native-select
+               db query values return-type))))
 
-(unless (fboundp 'sqlite-more-p)
+(when anvil-runtime-polyfills--sqlite-needs-set-polyfill
+  (when anvil-runtime-polyfills--sqlite-native-more
   (defun sqlite-more-p (cursor)
-    "Return non-nil while CURSOR has un-consumed rows."
-    (and (consp cursor)
-         (eq (car cursor) :anvil-sqlite-cursor)
-         (cdr cursor))))
-
-(unless (fboundp 'sqlite-next)
+    "Handle polyfilled cursors and delegate native cursors unchanged."
+    (if (and (consp cursor) (eq (car cursor) :anvil-sqlite-cursor))
+        (cdr cursor)
+      (funcall anvil-runtime-polyfills--sqlite-native-more cursor))))
+  (when anvil-runtime-polyfills--sqlite-native-next
   (defun sqlite-next (cursor)
-    "Pop and return the next row from CURSOR, advancing internal state."
-    (when (and (consp cursor)
-               (eq (car cursor) :anvil-sqlite-cursor)
-               (cdr cursor))
-      (let ((row (cadr cursor)))
-        (setcdr cursor (cddr cursor))
-        row))))
-
-(unless (fboundp 'sqlite-finalize)
+    "Advance polyfilled cursors and delegate native cursors unchanged."
+    (if (and (consp cursor) (eq (car cursor) :anvil-sqlite-cursor))
+        (when (cdr cursor)
+          (let ((row (cadr cursor))) (setcdr cursor (cddr cursor)) row))
+      (funcall anvil-runtime-polyfills--sqlite-native-next cursor))))
+  (when anvil-runtime-polyfills--sqlite-native-finalize
   (defun sqlite-finalize (cursor)
-    "Release CURSOR.  For the list-backed polyfill this just clears
-the remaining-rows tail."
-    (when (and (consp cursor)
-               (eq (car cursor) :anvil-sqlite-cursor))
-      (setcdr cursor nil))))
+    "Finalize either cursor shape using its owning implementation."
+    (if (and (consp cursor) (eq (car cursor) :anvil-sqlite-cursor))
+        (setcdr cursor nil)
+      (funcall anvil-runtime-polyfills--sqlite-native-finalize cursor)))))
+
+(unless anvil-runtime-polyfills--sqlite-native-more
+  (defun sqlite-more-p (cursor)
+    "Return non-nil while a polyfilled cursor has rows left."
+    (if (and (consp cursor) (eq (car cursor) :anvil-sqlite-cursor))
+        (cdr cursor)
+      (when anvil-runtime-polyfills--sqlite-native-more
+        (funcall anvil-runtime-polyfills--sqlite-native-more cursor)))))
+(unless anvil-runtime-polyfills--sqlite-native-next
+  (defun sqlite-next (cursor)
+    "Pop one row from a polyfilled cursor."
+    (if (and (consp cursor) (eq (car cursor) :anvil-sqlite-cursor))
+        (when (cdr cursor)
+          (let ((row (cadr cursor))) (setcdr cursor (cddr cursor)) row))
+      (when anvil-runtime-polyfills--sqlite-native-next
+        (funcall anvil-runtime-polyfills--sqlite-native-next cursor)))))
+(unless anvil-runtime-polyfills--sqlite-native-finalize
+  (defun sqlite-finalize (cursor)
+    "Clear a polyfilled cursor's buffered rows."
+    (if (and (consp cursor) (eq (car cursor) :anvil-sqlite-cursor))
+        (setcdr cursor nil)
+      (when anvil-runtime-polyfills--sqlite-native-finalize
+        (funcall anvil-runtime-polyfills--sqlite-native-finalize cursor)))))
 
 
 ;; --- benchmark / profiler stubs ------------------------------------

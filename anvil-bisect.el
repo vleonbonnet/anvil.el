@@ -80,7 +80,10 @@ non-decisive outcome)."
   :type 'directory
   :group 'anvil-bisect)
 
-(defcustom anvil-bisect-emacs-program (or invocation-name "emacs")
+(defcustom anvil-bisect-emacs-program
+  (if (and invocation-name invocation-directory)
+      (expand-file-name invocation-name invocation-directory)
+    "emacs")
   "Emacs executable used for subprocess steps.  Defaults to the
 running Emacs's path so the bisect steps run the same version as
 the caller."
@@ -314,6 +317,17 @@ or the lookup silently reads the wrong repository."
         (insert-file-contents candidate)
         (buffer-string)))))
 
+(defun anvil-bisect--terminal-first-bad-sha (log)
+  "Extract the SHA from a terminal first-bad header in LOG.
+Accept both Git's historical `first bad commit' spelling and the
+quoted `first \'bad\' commit' spelling.  Candidate lines emitted for
+skipped commits are deliberately excluded."
+  (when (and log
+             (string-match
+              "^# first \\(?:bad\\|'bad'\\) commit: \\[\\([[:xdigit:]]+\\)\\]"
+              log))
+    (match-string 1 log)))
+
 (defun anvil-bisect--first-bad-sha (log)
   "Extract the final \"first bad commit\" SHA from a bisect log string.
 Prefers the terminating `# first bad commit' header that git
@@ -324,10 +338,8 @@ first `# bad:' is the initial bad ref, not the introducing
 commit."
   (when log
     (cond
-     ((string-match
-       "# first bad commit: \\[\\([0-9a-f]+\\)\\]"
-       log)
-      (match-string 1 log))
+     ((anvil-bisect--terminal-first-bad-sha log)
+      (anvil-bisect--terminal-first-bad-sha log))
      (t
       (let ((pat "# bad: \\[\\([0-9a-f]+\\)\\]")
             (start 0) (last-sha nil))
@@ -379,15 +391,16 @@ where `git bisect' runs."
           (_
            (setq outcome 'error)
            (throw 'done nil)))
-        ;; `git bisect' prints a terminal "first bad commit" line when
-        ;; the range collapses to a single commit.  Detect via rev-parse.
+        ;; `git bisect' prints a terminal first-bad header when the range
+        ;; collapses.  Only that exact header is conclusive: skipped
+        ;; commits produce "possible first" candidate lines instead.
         (let* ((log (anvil-bisect--collect-bisect-log worktree)))
-          (when (and log (string-match-p "first bad commit" log))
+          (when (anvil-bisect--terminal-first-bad-sha log)
             (setq outcome 'found)
             (throw 'done nil)))))
     (let* ((log (anvil-bisect--collect-bisect-log worktree))
            (sha (and (eq outcome 'found)
-                     (anvil-bisect--first-bad-sha log)))
+                     (anvil-bisect--terminal-first-bad-sha log)))
            (meta (and sha (anvil-bisect--commit-metadata repo sha)))
            (elapsed (float-time (time-subtract (current-time) t0))))
       (list :status outcome

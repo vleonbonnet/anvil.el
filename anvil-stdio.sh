@@ -84,6 +84,80 @@ fi
 ANVIL_EMACSCLIENT_RETRY_MAX=${ANVIL_EMACSCLIENT_RETRY_MAX:-60}
 ANVIL_EMACSCLIENT_RETRY_DELAY_MS=${ANVIL_EMACSCLIENT_RETRY_DELAY_MS:-100}
 
+# Keep the fallback self-contained: install.sh and install.ps1 deploy only
+# this bridge script.  read's here-document redirection is local to this
+# builtin, so emacsclient retains the bridge's original stdin.
+read -r -d '' _anvil_perl_timeout_program <<'PERL' || :
+use strict;
+use warnings;
+use POSIX qw(:sys_wait_h);
+use POSIX;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC usleep);
+sub fail { print STDERR "Anvil Perl timeout: $_[0]\n"; exit 69; }
+@ARGV >= 2 or fail('missing timeout or command');
+my $seconds = shift @ARGV;
+$seconds =~ /\A(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\z/ && $seconds > 0
+    or fail('timeout must be a finite positive number');
+my $delta = 0 + $seconds;
+POSIX::isfinite($delta) && $delta > 0 or fail('timeout must be a finite positive number');
+my $now = eval { clock_gettime(CLOCK_MONOTONIC) };
+defined($now) && $@ eq '' or fail('monotonic clock unavailable');
+my $deadline = $now + $delta;
+my $child_exited = 0;
+my $action = eval { POSIX::SigAction->new(sub { $child_exited = 1 },
+    POSIX::SigSet->new(), POSIX::SA_NOCLDSTOP()) };
+defined($action) or fail('SIGCHLD handling unavailable');
+eval { POSIX::sigaction(POSIX::SIGCHLD(), $action) == 0 or die 'sigaction failed'; 1 }
+    or fail('SIGCHLD handling unavailable');
+my $interrupted = 0;
+my %signal_number = (HUP => 1, INT => 2, TERM => 15);
+for my $name (keys %signal_number) {
+    my $number = $signal_number{$name};
+    $SIG{$name} = sub { $interrupted ||= $number };
+}
+if ($interrupted) { exit 128 + $interrupted; }
+my $pid = fork();
+defined($pid) or fail("fork failed: $!");
+if ($pid == 0) {
+    $SIG{$_} = 'DEFAULT' for keys %signal_number;
+    $SIG{CHLD} = 'DEFAULT';
+    setpgid(0, 0) == 0 or POSIX::_exit(126);
+    my @command = @ARGV;
+    exec { $command[0] } @command or POSIX::_exit(127);
+}
+sub signal_group { my ($sig) = @_; kill $sig, -$pid; kill $sig, $pid; }
+sub reap_child {
+    while (1) {
+        my $result = waitpid($pid, 0);
+        return $? if $result == $pid;
+        next if $result == -1 && $!{EINTR};
+        print STDERR "Anvil Perl timeout: waitpid failed: $!\n";
+        return 127 << 8;
+    }
+}
+sub grace_then_kill {
+    signal_group('TERM');
+    my $end = clock_gettime(CLOCK_MONOTONIC) + 1;
+    usleep(20_000) while clock_gettime(CLOCK_MONOTONIC) < $end;
+    signal_group('KILL');
+    return reap_child();
+}
+usleep(20_000) while !$child_exited && !$interrupted
+    && clock_gettime(CLOCK_MONOTONIC) < $deadline;
+if ($interrupted) { my $sig = $interrupted; grace_then_kill(); exit 128 + $sig; }
+if ($child_exited) {
+    # Do not reap the leader until its group is killed; this prevents PGID
+    # reuse and closes stdout inherited by orphaned descendants.
+    signal_group('KILL');
+    my $status = reap_child();
+    exit WEXITSTATUS($status) if WIFEXITED($status);
+    exit 128 + WTERMSIG($status) if WIFSIGNALED($status);
+    exit 1;
+}
+grace_then_kill();
+exit 124;
+PERL
+
 # anvil_emacsclient_retry STDERR_FILE -- EMACSCLIENT_ARGS...
 #
 # Run `emacsclient EMACSCLIENT_ARGS...', retrying on transient socket-
@@ -103,20 +177,26 @@ anvil_emacsclient_retry() {
 		# Default 330s (daemon's `with-timeout' is 300s — we sit
 		# slightly above so the daemon can return a richer error
 		# first when possible).  Set ANVIL_EMACSCLIENT_TIMEOUT=0
-		# to disable.  Prefer GNU timeout(1); fall back to perl
-		# alarm() since perl is universally pre-installed.
+		# to disable.  Prefer GNU timeout(1); otherwise use the
+		# process-group supervisor embedded in this script.
 		_anvil_tmo="${ANVIL_EMACSCLIENT_TIMEOUT:-330}"
 		if [ "$_anvil_tmo" = "0" ]; then
 			out=$(emacsclient "$@" 2>"$stderr_file")
+			rc=$?
 		elif command -v timeout >/dev/null 2>&1; then
-			out=$(timeout "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+			# GNU timeout otherwise waits forever for a TERM-resistant
+			# emacsclient to exit.  Escalate its command group to KILL
+			# after one second while timeout is monitoring it.
+			out=$(timeout -k 1 "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+			rc=$?
 		elif command -v perl >/dev/null 2>&1; then
-			out=$(perl -e 'alarm shift @ARGV; exec @ARGV' \
-				"$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+			out=$(perl -e "$_anvil_perl_timeout_program" "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+			rc=$?
 		else
-			out=$(emacsclient "$@" 2>"$stderr_file")
+			printf '%s\n' "Anvil: no usable timeout backend (GNU timeout or Perl supervisor)" >"$stderr_file"
+			out=""
+			rc=69
 		fi
-		rc=$?
 		set -e
 		if [ "$rc" -eq 0 ]; then
 			printf '%s' "$out"

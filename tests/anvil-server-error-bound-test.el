@@ -57,7 +57,7 @@
                 (signal 'error (list (number-sequence 1 10000))))
                :type 'anvil-server-tool-error))
          (msg (cadr err)))
-    (should (string-match-p "\\.\\.\\." msg))
+    (should (string-match-p "<depth>" msg))
     (should (< (length msg) 1000))))
 
 (ert-deftest anvil-server-error-bound-test-small-error-unchanged ()

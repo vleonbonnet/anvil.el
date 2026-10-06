@@ -38,6 +38,15 @@
        (ignore-errors (delete-process ,var))
        (ignore-errors (delete-process srv)))))
 
+(defun anvil-eval-server-execute-test--server-args (proc evalexprs dontkill)
+  "Build valid `server-execute' arguments for PROC and DONTKILL.
+On Emacs 30+, EVALEXPRS occupies index 4 while DONTKILL is at index 5."
+  (if (>= emacs-major-version 30)
+      ;; Emacs 30+: proc files nowait commands evalexprs dontkill frame tty-name.
+      (list proc nil nil nil evalexprs dontkill nil nil)
+    ;; Older releases place dontkill at argument index 4.
+    (list proc nil nil nil dontkill nil nil)))
+
 (ert-deftest anvil-eval-server-execute-test-abnormal-exit-replies ()
   "Abnormal unwind sends an -error reply and deletes the connection."
   (anvil-eval-server-execute-test--with-open-process proc
@@ -47,9 +56,11 @@
                 ((symbol-function 'delete-process)
                  (lambda (p) (setq deleted p))))
         (catch 'abort
-          (anvil-eval--server-execute-cleanup-advice
-           (lambda (&rest _) (throw 'abort nil))
-           proc nil nil nil nil nil nil)))
+          (apply #'anvil-eval--server-execute-cleanup-advice
+                 (lambda (&rest _) (throw 'abort nil))
+                 ;; A non-nil evalexprs value at index 4 must not be
+                 ;; mistaken for dontkill on Emacs 30+.
+                 (anvil-eval-server-execute-test--server-args proc t nil))))
       (should sent)
       (should (string-prefix-p "-error " sent))
       (should (eq deleted proc)))))
@@ -63,9 +74,9 @@
                 ((symbol-function 'delete-process)
                  (lambda (p) (setq deleted p))))
         (catch 'abort
-          (anvil-eval--server-execute-cleanup-advice
-           (lambda (&rest _) (throw 'abort nil))
-           proc nil nil nil nil t nil nil)))   ; dontkill = t at index 5
+          (apply #'anvil-eval--server-execute-cleanup-advice
+                 (lambda (&rest _) (throw 'abort nil))
+                 (anvil-eval-server-execute-test--server-args proc nil t))))
       (should-not sent)
       (should-not deleted))))
 
@@ -77,9 +88,9 @@
                  (lambda (_p s) (setq sent s))))
         ;; Real server-execute replies and deletes the client itself;
         ;; simulate that teardown in the wrapped function.
-        (anvil-eval--server-execute-cleanup-advice
-         (lambda (&rest _) (delete-process proc) 'done)
-         proc nil nil nil nil nil nil))
+        (apply #'anvil-eval--server-execute-cleanup-advice
+               (lambda (&rest _) (delete-process proc) 'done)
+               (anvil-eval-server-execute-test--server-args proc nil nil)))
       (should-not sent))))
 
 (ert-deftest anvil-eval-server-execute-test-normal-wait-client-untouched ()
@@ -98,9 +109,9 @@ COMPLETED sentinel must suppress teardown — without it the bare
                  (lambda (p) (setq deleted p))))
         ;; orig-fn returns normally and, like a waiting editor client,
         ;; leaves the still-open connection in place.
-        (anvil-eval--server-execute-cleanup-advice
-         (lambda (&rest _) 'done)
-         proc nil nil nil nil nil nil nil))
+        (apply #'anvil-eval--server-execute-cleanup-advice
+               (lambda (&rest _) 'done)
+               (anvil-eval-server-execute-test--server-args proc nil nil)))
       (should-not sent)
       (should-not deleted)
       (should (eq (process-status proc) 'open)))))

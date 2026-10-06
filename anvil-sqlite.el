@@ -109,14 +109,16 @@ happens.  Errors out of the SQLite layer are bubbled up via
                  (push row rows)
                  (cl-incf count))))
            (when stmt (sqlite-finalize stmt))
+           ;; PUSH stores rows in reverse order. Restore query order before
+           ;; clipping so the cap retains the first rows returned by SQLite.
+           (setq rows (nreverse rows))
            (when (> (length rows) anvil-sqlite-max-rows)
              (setq truncated t)
              (setq rows (cl-subseq rows 0 anvil-sqlite-max-rows))))
        (ignore-errors (sqlite-close db)))
-     (let ((ordered (nreverse rows)))
-       (format "%S" (list :row-count (length ordered)
+     (format "%S" (list :row-count (length rows)
                           :truncated (and truncated t)
-                          :rows ordered))))))
+                          :rows rows)))))
 
 ;;; Module lifecycle
 

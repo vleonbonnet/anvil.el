@@ -290,7 +290,9 @@ discarded.  To hard-stop offload work, call `anvil-future-kill'
   "Hard-kill the subprocess slot owning FUTURE; settle it as errored.
 Unlike `anvil-future-cancel', this terminates the REPL process so
 a runaway call cannot keep tying up its pool slot.  The sentinel
-nils out the slot; the next `anvil-offload' dispatch respawns it.
+nils out the slot; after `kill-process' returns, this function also
+synchronously clears every pool slot referring to that process so
+the next `anvil-offload' dispatch can respawn it.
 
 The elapsed wall time (seconds since the future's `created-at') is
 stored in `anvil-future--err' so callers can report it.  Returns
@@ -298,7 +300,11 @@ FUTURE."
   (let ((proc (anvil-future--process future))
         (elapsed (- (float-time) (anvil-future--created-at future))))
     (when (and proc (process-live-p proc))
-      (kill-process proc))
+      (kill-process proc)
+      (when anvil-offload--pool
+        (dotimes (i (length anvil-offload--pool))
+          (when (eq proc (aref anvil-offload--pool i))
+            (aset anvil-offload--pool i nil)))))
     (when (eq 'pending (anvil-future--status future))
       (remhash (anvil-future--id future) (anvil-offload--ensure-pending))
       (setf (anvil-future--status future) 'killed
