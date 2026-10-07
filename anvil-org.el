@@ -82,6 +82,7 @@
 (require 'anvil-eval)
 (require 'anvil-server)
 (require 'org)
+(require 'org-element)
 (require 'ob-core)
 (require 'org-id)
 (require 'url-util)
@@ -301,7 +302,7 @@ Check your Emacs hooks (`before-revert-hook', \
   "Return the #+begin_src line for source-block ELEMENT."
   (save-excursion
     (goto-char (org-element-property :begin element))
-    (if-let ((head (org-babel-where-is-src-block-head)))
+    (if-let* ((head (org-babel-where-is-src-block-head)))
         (line-number-at-pos head)
       (line-number-at-pos))))
 
@@ -373,7 +374,7 @@ Check your Emacs hooks (`before-revert-hook', \
             (insert-file-contents path)
             ;; Name discovery is text-based so it does not initialize Org's
             ;; element cache for every allowed file during an MCP call.
-            (when-let ((pos (org-babel-find-named-block block-name)))
+            (when-let* ((pos (org-babel-find-named-block block-name)))
               (push (list :file path :line (line-number-at-pos pos))
                     matches))))
         (cond

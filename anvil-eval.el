@@ -88,6 +88,8 @@ calls remain available in NeLisp's own global/function tables."
 
 ;;; Org-mode fast mode
 
+(declare-function org-agenda-files "org" (&optional unrestricted archives))
+
 (defvar anvil-eval--in-org-fast-mode nil
   "Non-nil when MCP tool is running with fast org-mode.
 Set automatically for the duration of each MCP tool call.")
