@@ -526,6 +526,26 @@ no-ops in that case; the tool must detect the no-op and throw."
            (should (equal "anvil-test-babel"
                           (plist-get target :block-name)))))))))
 
+(ert-deftest anvil-org-test-babel-name-lookup-logs-no-warnings ()
+  "Name-only lookup must not run the element parser in non-Org buffers."
+  (anvil-org-test--with-temp-org
+   "* Heading\n#+NAME: anvil-test-babel\n#+header: :results silent\n#+begin_src emacs-lisp\n(+ 2 3)\n#+end_src\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           warnings)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args) (push args warnings)))
+                 ((symbol-function 'org-element-at-point)
+                  (lambda (&rest _args)
+                    (error "unexpected element parsing"))))
+         (let ((target (anvil-org--babel-target nil nil "anvil-test-babel")))
+           (should (equal path (plist-get target :file)))
+           (should (= 4 (plist-get target :line)))
+           (should (null (anvil-org--babel-named-block-line
+                          path "anvil-test-missing")))
+           (should (null warnings))))))))
+
 (ert-deftest anvil-org-test-eval-babel-by-line-preserves-point ()
   "Line-based Babel execution reverts clean buffers without moving point."
   (anvil-org-test--with-temp-org

@@ -353,6 +353,22 @@ Check your Emacs hooks (`before-revert-hook', \
         (list expanded))
     (anvil-org--org-files-for-tool nil)))
 
+(defun anvil-org--babel-named-block-line (path name)
+  "Return the source header line of the Babel block NAME in PATH, or nil.
+Discovery is purely textual: it neither enables `org-mode' nor calls
+the element parser, so scanning every allowed file during an MCP call
+initializes no element cache and logs no `org-element' warnings about
+non-Org buffers (`org-babel-find-named-block' goes through
+`org-next-block', which parses elements).  The match is validated
+against the real element tree when the block executes."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (goto-char (point-min))
+    (let ((case-fold-search t))
+      (when (re-search-forward
+             (org-babel-named-src-block-regexp-for-name name) nil t)
+        (line-number-at-pos (match-beginning 1))))))
+
 (defun anvil-org--babel-target (&optional file line block-name)
   "Resolve FILE/LINE or BLOCK-NAME to a validated Babel target plist."
   (when (and file (not (stringp file)))
@@ -370,13 +386,9 @@ Check your Emacs hooks (`before-revert-hook', \
      (block-name
       (let (matches)
         (dolist (path files)
-          (with-temp-buffer
-            (insert-file-contents path)
-            ;; Name discovery is text-based so it does not initialize Org's
-            ;; element cache for every allowed file during an MCP call.
-            (when-let* ((pos (org-babel-find-named-block block-name)))
-              (push (list :file path :line (line-number-at-pos pos))
-                    matches))))
+          (when-let* ((target-line
+                       (anvil-org--babel-named-block-line path block-name)))
+            (push (list :file path :line target-line) matches)))
         (cond
          ((null matches)
           (anvil-org--tool-validation-error
