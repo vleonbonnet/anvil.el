@@ -450,29 +450,81 @@ with local-only changes is used as-is."
     (anvil-org--babel-check-buffer-changes file)
     buf))
 
+(defun anvil-org--babel-settle-buffer (buf file was-modified hash-before)
+  "Save BUF visiting FILE when Babel changed it and it was clean before.
+WAS-MODIFIED is whether BUF had unsaved edits before execution and
+HASH-BEFORE its `buffer-hash' then.  A buffer holding prior user edits
+is never saved, so those edits are not written behind the user's back.
+Return a plist with :modified, :saved, :vc and, when the caller has
+follow-up work, :notice."
+  (if (not (buffer-live-p buf))
+      (list :modified nil :saved nil :vc nil)
+    (with-current-buffer buf
+      (let ((vc (ignore-errors (vc-backend file)))
+            (changed (and (buffer-modified-p)
+                          (not (equal (buffer-hash) hash-before))))
+            saved notice)
+        (cond
+         ;; Results rewritten with identical text: nothing to save.
+         ((not changed)
+          (unless was-modified
+            (restore-buffer-modified-p nil)))
+         (was-modified
+          (setq notice
+                (format "Buffer %s had unsaved edits before the run, so the \
+block's results were left unsaved alongside them.  Ask the user before \
+saving it%s."
+                        (buffer-name)
+                        (if vc (format ", then commit %s (tracked by %s)" file vc) ""))))
+         ((not (verify-visited-file-modtime buf))
+          (setq notice
+                (format "Buffer %s holds the block's results but %s changed on \
+disk during the run, so it was not saved.  Ask the user to resolve the \
+conflict%s."
+                        (buffer-name) file
+                        (if vc (format ", then commit it (tracked by %s)" vc) ""))))
+         (t
+          (let ((save-silently t))
+            (save-buffer))
+          (setq saved t
+                notice
+                (format "Saved %s with the block's results.%s"
+                        file
+                        (if vc (format "  It is tracked by %s: commit the change." vc) "")))))
+        (append (list :modified (buffer-modified-p) :saved saved :vc vc)
+                (and notice (list :notice notice)))))))
+
 (defun anvil-org--babel-execute (file line block-name)
   "Execute the Babel block selected by FILE, LINE, and BLOCK-NAME.
-This function runs inside an `emacs-eval-async' job."
-  (let ((buf (anvil-org--babel-prepare-buffer file)))
+This function runs inside an `emacs-eval-async' job.  Results Babel
+writes into a previously clean buffer are saved; see
+`anvil-org--babel-settle-buffer' for the returned buffer state."
+  (let* ((buf (anvil-org--babel-prepare-buffer file))
+         (was-modified (buffer-modified-p buf))
+         (hash-before (with-current-buffer buf (buffer-hash))))
     (with-current-buffer buf
-      (save-window-excursion
-        (save-restriction
-          (widen)
-          (save-excursion
-            (let* ((element (if block-name
-                                (anvil-org--babel-element-named block-name)
-                              (anvil-org--babel-element-at-line line))))
-              (goto-char (org-element-property :begin element))
-              (goto-char (or (org-babel-where-is-src-block-head)
-                             (point)))
-              (let* ((info (org-babel-get-src-block-info 'light element))
-                     (result (let ((org-confirm-babel-evaluate nil))
-                               (org-babel-execute-src-block
-                                nil info nil))))
-                (list :file file
-                      :line (anvil-org--babel-source-line element)
-                      :block-name (org-element-property :name element)
-                      :result result)))))))))
+      (let ((execution
+             (save-window-excursion
+               (save-restriction
+                 (widen)
+                 (save-excursion
+                   (let* ((element (if block-name
+                                       (anvil-org--babel-element-named block-name)
+                                     (anvil-org--babel-element-at-line line))))
+                     (goto-char (org-element-property :begin element))
+                     (goto-char (or (org-babel-where-is-src-block-head)
+                                    (point)))
+                     (let* ((info (org-babel-get-src-block-info 'light element))
+                            (result (let ((org-confirm-babel-evaluate nil))
+                                      (org-babel-execute-src-block
+                                       nil info nil))))
+                       (list :file file
+                             :line (anvil-org--babel-source-line element)
+                             :block-name (org-element-property :name element)
+                             :result result))))))))
+        (append execution
+                (anvil-org--babel-settle-buffer
+                 buf file was-modified hash-before))))))
 
 (defun anvil-org--tool-eval-babel (&optional file line block_name)
   "Start asynchronous execution of an Org Babel source block.
@@ -489,7 +541,12 @@ Returns the job ID string (for example, `job-12-1711843200').  Poll it with
 `emacs-eval-result'.  Before the job is queued and again when it starts,
 buffer-only unsaved changes are allowed, but a conflict where both buffer
 and disk changed is rejected.  Clean buffers are reverted from disk, and
-all buffer navigation is wrapped in `save-excursion'."
+all buffer navigation is wrapped in `save-excursion'.
+
+Babel writes results into the buffer.  When it was clean before the
+run, the buffer is saved afterwards; otherwise the user's unsaved edits
+and the results are left unsaved together.  The job result reports
+:modified, :saved, :vc and, when follow-up is needed, :notice."
   (let* ((target (anvil-org--babel-target file line block_name))
          (path (plist-get target :file))
          (target-line (plist-get target :line))
@@ -2502,7 +2559,12 @@ buffers are reverted from disk.  Buffer navigation is saved, and the block
 runs with Babel confirmation disabled for noninteractive execution.
 
 Returns the job ID string.  Poll with emacs-eval-result.
-The block's normal Babel result handling still applies.
+The block's normal Babel result handling still applies: results are
+written into the Org buffer.  When that buffer was clean before the run,
+it is saved afterwards; a buffer that already held the user's unsaved
+edits is left unsaved.  The job result plist reports :modified, :saved
+and :vc (version-control backend or nil), plus a :notice string when
+follow-up is needed (commit the saved file, or ask the user to save).
 
 Provide either block_name, or both file and line."
    :read-only nil

@@ -617,4 +617,101 @@ no-ops in that case; the tool must detect the no-op and throw."
            (set-buffer-modified-p nil))
          (kill-buffer buf))))))
 
+(defconst anvil-org-test--babel-value-block
+  "#+name: anvil-test-babel\n#+begin_src emacs-lisp\n(+ 2 3)\n#+end_src\n"
+  "Babel block whose value result is written into the buffer.")
+
+(defun anvil-org-test--discard-buffer (path)
+  "Kill the buffer visiting PATH without saving or prompting."
+  (when-let* ((buf (find-buffer-visiting path)))
+    (with-current-buffer buf
+      (set-buffer-modified-p nil))
+    (kill-buffer buf)))
+
+(ert-deftest anvil-org-test-eval-babel-saves-clean-buffer ()
+  "Results written into a clean buffer are saved and reported."
+  (anvil-org-test--with-temp-org
+   anvil-org-test--babel-value-block
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t))
+       (unwind-protect
+           (let ((result (anvil-org--babel-execute path 3 nil)))
+             (should (= 5 (plist-get result :result)))
+             (should (plist-get result :saved))
+             (should-not (plist-get result :modified))
+             (should-not (buffer-modified-p (find-buffer-visiting path)))
+             (should (string-match-p "#\\+RESULTS: anvil-test-babel\n: 5"
+                                     (anvil-org-test--read path)))
+             (should (string-match-p "\\`Saved "
+                                     (plist-get result :notice))))
+         (anvil-org-test--discard-buffer path))))))
+
+(ert-deftest anvil-org-test-eval-babel-notice-asks-to-commit-tracked-file ()
+  "Saving a version-controlled file tells the agent to commit it."
+  (skip-unless (executable-find "git"))
+  (let* ((dir (make-temp-file "anvil-org-test-git-" t))
+         (path (expand-file-name "notes.org" dir))
+         (default-directory (file-name-as-directory dir)))
+    (unwind-protect
+        (let ((anvil-org-allowed-files (list path))
+              (anvil-org-allowed-files-enabled t))
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region anvil-org-test--babel-value-block nil path nil 'silent))
+          (should (zerop (call-process "git" nil nil nil "init" "-q")))
+          (should (zerop (call-process "git" nil nil nil "add" "notes.org")))
+          (let ((result (anvil-org--babel-execute path 3 nil)))
+            (should (plist-get result :saved))
+            (should (eq 'Git (plist-get result :vc)))
+            (should (string-match-p "tracked by Git: commit the change"
+                                    (plist-get result :notice)))))
+      (anvil-org-test--discard-buffer path)
+      (delete-directory dir t))))
+
+(ert-deftest anvil-org-test-eval-babel-identical-results-stay-clean ()
+  "Re-running a block with unchanged results neither saves nor notifies."
+  (anvil-org-test--with-temp-org
+   anvil-org-test--babel-value-block
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t))
+       (unwind-protect
+           (progn
+             (should (plist-get (anvil-org--babel-execute path 3 nil) :saved))
+             (let ((modtime (file-attribute-modification-time
+                             (file-attributes path)))
+                   (result (anvil-org--babel-execute path 3 nil)))
+               (should-not (plist-get result :saved))
+               (should-not (plist-get result :modified))
+               (should-not (plist-get result :notice))
+               (should-not (buffer-modified-p (find-buffer-visiting path)))
+               (should (equal modtime (file-attribute-modification-time
+                                       (file-attributes path))))))
+         (anvil-org-test--discard-buffer path))))))
+
+(ert-deftest anvil-org-test-eval-babel-keeps-user-edits-unsaved ()
+  "A buffer with prior user edits is not saved; the notice says so."
+  (anvil-org-test--with-temp-org
+   anvil-org-test--babel-value-block
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (buf (find-file-noselect path t)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf
+               (goto-char (point-max))
+               (insert "unsaved local change\n"))
+             (let ((result (anvil-org--babel-execute path 3 nil)))
+               (should-not (plist-get result :saved))
+               (should (plist-get result :modified))
+               (should (string-match-p "Ask the user before saving"
+                                       (plist-get result :notice))))
+             (should (buffer-modified-p buf))
+             (should (string-match-p "#\\+RESULTS: anvil-test-babel"
+                                     (with-current-buffer buf (buffer-string))))
+             (should-not (string-match-p "RESULTS\\|unsaved local change"
+                                         (anvil-org-test--read path))))
+         (anvil-org-test--discard-buffer path))))))
+
 ;;; anvil-org-test.el ends here
