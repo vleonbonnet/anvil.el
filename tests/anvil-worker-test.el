@@ -748,6 +748,20 @@ deadlock on Windows (2026-04-16) that could not be broken with
               (anvil-worker-call "(emacs-pid)" :kind :read :timeout 1))
             (should (equal '(client server) dispatched))))))))
 
+(ert-deftest anvil-worker-test-emacsclient-result-has-no-sentinel-text ()
+  "The emacsclient dispatcher returns only the client output."
+  (anvil-worker-test--with-fresh-latency
+    (let ((orig (symbol-function 'start-process)))
+      ;; Stand in for emacsclient with a process that prints 42 and exits.
+      (cl-letf (((symbol-function 'start-process)
+                 (lambda (name buf &rest _)
+                   (funcall orig name buf "printf" "42"))))
+        (should (equal "42"
+                       (anvil-worker--dispatch-via-emacsclient
+                        '(:name "anvil-worker-read-1" :lane :read
+                          :server-file "unused")
+                        "42" 5)))))))
+
 ;;;; --- MCP probe / reset-pool tools --------------------------------------
 
 (ert-deftest anvil-worker-test-tool-probe-reports-per-lane ()
