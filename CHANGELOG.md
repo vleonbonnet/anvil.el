@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Deferred tool answers: a handler may return `anvil-server-defer` with a function telling whether its answer is there, rather than wait in Emacs, while `anvil-server-can-defer-p`.  The stdio bridge, which binds `anvil-server-deferrable`, holds the request and polls `anvil-server-deferred-poll` once a second, each poll returning at once, and answers the other requests meanwhile; a request the client cancels stops its poller.  Handlers read the request's `_meta`, such as the calling OpenCode session, from `anvil-server-request-meta`.
+
 ## [1.4.1] - 2026-10-04
 
 ### Fixed

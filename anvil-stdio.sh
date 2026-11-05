@@ -383,64 +383,16 @@ anvil_mcp_emit_framed_response() {
 	printf 'Content-Length: %s\r\n\r\n%s' "$n" "$body"
 }
 
-# Process input and print response
-while IFS= read -r line; do
-	# T71: detect framing.  An MCP framed request begins with
-	# `Content-Length:' (case-insensitive); legacy line-delimited
-	# requests begin with `{'.
-	# Strip CR for cross-platform safety.
-	_anvil_first_line="${line%$'\r'}"
-	_anvil_framed=0
-	if [[ "$_anvil_first_line" =~ ^[Cc]ontent-[Ll]ength: ]]; then
-		_anvil_framed=1
-		mcp_debug_log "FRAMING" "Content-Length detected"
-		# Re-read full framed message; reuse the already-consumed line.
-		line=$(anvil_mcp_read_framed_message "$_anvil_first_line") || {
-			mcp_debug_log "FRAMING-ERROR" "rc=$? first=$_anvil_first_line"
-			continue
-		}
-	fi
-
-	# Log the incoming request
-	mcp_debug_log "REQUEST" "$line"
-
-	# Base64 encode the raw JSON to avoid emacsclient transport issues
-	# with a specific combination of length, UTF-8 characters, and quoting
-	# that occurs in Test 5 with the Lithuanian letter 'ą'
-	base64_input=$(echo -n "$line" | base64)
-	mcp_debug_log "BASE64-INPUT" "$base64_input"
-
-	# Process JSON-RPC request and return the result with proper UTF-8 encoding
-	# Encode the response to base64 to avoid any character encoding issues
-	# Handle nil responses from notifications by converting to empty string
-	elisp_expr="(base64-encode-string (encode-coding-string (or (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\") \"\") 'utf-8 t) t)"
-
-	# Get response from emacsclient (with retry across daemon restarts).
-	# Capture stderr for debugging and rc for logging only; existing code
-	# downstream treats an empty `base64_response' as a soft failure.
-	stderr_file="/tmp/mcp-stderr.$$-$(date +%s%N)"
-	set +e
-	base64_response=$(anvil_emacsclient_retry "$stderr_file" -- \
-		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-		-e "$elisp_expr")
-	_anvil_client_rc=$?
-	set -e
-	mcp_debug_log "EMACSCLIENT-RC" "$_anvil_client_rc"
-
-	# Check for stderr output
-	if [ -s "$stderr_file" ]; then
-		mcp_debug_log "EMACSCLIENT-STDERR" "$(cat "$stderr_file")"
-	fi
-	rm -f "$stderr_file"
-
-	mcp_debug_log "BASE64-RESPONSE" "$base64_response"
-
-	# Handle the base64 response - first strip quotes if present
-	if [[ "$base64_response" == \"* && "$base64_response" == *\" ]]; then
-		# Remove the surrounding quotes
-		base64_response="${base64_response:1:${#base64_response}-2}"
-		# Unescape any quotes inside
-		base64_response="${base64_response//\\\"/\"}"
+# anvil_decode_reply RAW
+#
+# Sets _anvil_reply to the text RAW, emacsclient's printed base64
+# string, encodes.
+anvil_decode_reply() {
+	local raw="$1" decoded rc err_file
+	# Strip the quotes emacsclient prints around a string.
+	if [[ "$raw" == \"* && "$raw" == *\" ]]; then
+		raw="${raw:1:${#raw}-2}"
+		raw="${raw//\\\"/\"}"
 	fi
 
 	# Repair Windows MSYS frame-boundary corruption.
@@ -465,59 +417,263 @@ while IFS= read -r line; do
 	# `set -e -o pipefail'.  Stripping the marker textually, before
 	# decoding, is what makes Windows work at all.
 	# (No-op on Linux/macOS where one frame fits in one read.)
-	base64_response=$(printf '%s' "$base64_response" \
+	raw=$(printf '%s' "$raw" \
 		| sed 's/\*ERROR\*: Unknown message: //g' \
 		| tr -d '\r\n')
 
 	# Diagnostic: confirm strip actually happened.  If markers survived,
 	# base64 -d will almost certainly fail below, and we want the log to
 	# say so out loud rather than just ending at BASE64-RESPONSE.
-	_anvil_marker_survivors=$(printf '%s' "$base64_response" | grep -c '\*ERROR\*' || true)
-	mcp_debug_log "INFO" "after-strip len=${#base64_response} markers=$_anvil_marker_survivors"
+	mcp_debug_log "INFO" "after-strip len=${#raw} markers=$(printf '%s' "$raw" | grep -c '\*ERROR\*' || true)"
 
 	# Decode the base64 content (lenient against stray non-base64 bytes).
 	# Capture rc/stderr explicitly so that a decode failure is logged
 	# instead of silently killing the script under `set -e -o pipefail'.
-	_anvil_decode_err="/tmp/mcp-decode-err.$$-$(date +%s%N)"
+	err_file="$_anvil_state.decode-err.$$-$RANDOM"
 	set +e
-	formatted_response=$(printf '%s' "$base64_response" | base64 -d $_anvil_b64_flags 2>"$_anvil_decode_err")
-	_anvil_decode_rc=$?
+	decoded=$(printf '%s' "$raw" | base64 -d $_anvil_b64_flags 2>"$err_file")
+	rc=$?
 	set -e
-	if [ "$_anvil_decode_rc" != 0 ]; then
-		mcp_debug_log "DECODE-ERROR" "rc=$_anvil_decode_rc stderr=$(cat "$_anvil_decode_err" 2>/dev/null | tr '\n' ' ') input_head=${base64_response:0:160}"
+	if [ "$rc" != 0 ]; then
+		mcp_debug_log "DECODE-ERROR" "rc=$rc stderr=$(tr '\n' ' ' <"$err_file" 2>/dev/null) input_head=${raw:0:160}"
 	fi
-	rm -f "$_anvil_decode_err"
+	rm -f "$err_file"
+	_anvil_reply="$decoded"
+}
+
+# anvil_call_emacs EXPR
+#
+# Evaluates EXPR, which returns a string encoded in base64, in Emacs,
+# and sets _anvil_reply to that string decoded, and _anvil_client_rc to
+# emacsclient's status.
+anvil_call_emacs() {
+	local stderr_file="$_anvil_state.stderr.$$-$RANDOM" raw
+	set +e
+	raw=$(anvil_emacsclient_retry "$stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "$1")
+	_anvil_client_rc=$?
+	set -e
+	mcp_debug_log "EMACSCLIENT-RC" "$_anvil_client_rc"
+	if [ -s "$stderr_file" ]; then
+		mcp_debug_log "EMACSCLIENT-STDERR" "$(<"$stderr_file")"
+	fi
+	rm -f "$stderr_file"
+	mcp_debug_log "BASE64-RESPONSE" "$raw"
+	anvil_decode_reply "$raw"
+}
+
+# anvil_emit BODY FRAMED
+#
+# Writes BODY to the client, framed when FRAMED is 1, alone on standard
+# output: deferred answers come from other processes, and a lock keeps
+# their responses whole.
+anvil_emit() {
+	# noclobber creates the lock exclusively, as a builtin.
+	until (set -C && : >"$_anvil_out_lock") 2>/dev/null; do
+		sleep 0.01
+	done
+	if [ "$2" = "1" ]; then
+		# T71: framed output for MCP-compliant clients.
+		anvil_mcp_emit_framed_response "$1"
+	else
+		# Legacy line-delimited output (dev / test mode).
+		printf '%s\n' "$1"
+	fi
+	rm -f "$_anvil_out_lock"
+}
+
+# anvil_request_id REQUEST
+#
+# Prints the JSON id of REQUEST, as written there, or nothing.
+anvil_request_id() {
+	printf '%s' "$1" \
+		| sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*"|null).*/\1/p' \
+		| head -1
+}
+
+# anvil_emit_error ID MESSAGE FRAMED
+#
+# Answers the request ID with a JSON-RPC internal error saying MESSAGE.
+anvil_emit_error() {
+	anvil_emit "$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}' "$1" "$2")" "$3"
+}
+
+# --- Deferred answers ---------------------------------------------------
+# A tool whose answer comes later answers "anvil-deferred:JOB:SECONDS"
+# rather than a response (see `anvil-server-defer').  The bridge then
+# polls `anvil-server-deferred-poll' in a process of its own, each call
+# returning at once, and writes the response once it is there, while it
+# goes on reading and answering other requests: Emacs never waits, and
+# neither do the other requests.  The poller gives up SECONDS plus a
+# minute after it began, answering an error; a request the client
+# cancels has its poller stopped.
+
+# The bridge's files: its output lock, and a file per poller, named by
+# the request it holds, giving its process and job.
+_anvil_state="${TMPDIR:-/tmp}"
+_anvil_state="${_anvil_state%/}/anvil-stdio-$$"
+_anvil_out_lock="$_anvil_state.lock"
+
+anvil_cleanup() {
+	local hold pid job
+	for hold in "$_anvil_state".hold-*; do
+		if [ -f "$hold" ]; then
+			read -r pid job <"$hold" || true
+			kill "$pid" 2>/dev/null || true
+			rm -f "$hold"
+		fi
+	done
+	rm -f "$_anvil_out_lock"
+}
+trap anvil_cleanup EXIT
+# Signals end the bridge through its exit, so that its pollers stop.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# anvil_hold_name ID
+#
+# Prints the name of the file holding the poller of the request ID.
+anvil_hold_name() {
+	printf '%s.hold-%s' "$_anvil_state" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# anvil_hold_deferred JOB SECONDS ID FRAMED
+anvil_hold_deferred() {
+	local job="$1" id="$3" framed="$4" reply delay=0.2 failures=0
+	local deadline=$((SECONDS + $2 + 60))
+	while :; do
+		sleep "$delay"
+		# A bridge gone, its client is too.
+		kill -0 "$$" 2>/dev/null || break
+		case "$delay" in
+		0.2) delay=0.5 ;;
+		0.5) delay=1 ;;
+		esac
+		anvil_call_emacs "(base64-encode-string (encode-coding-string (or (anvil-server-deferred-poll \"$job\") \"\") 'utf-8 t) t)"
+		reply="$_anvil_reply"
+		case "$reply" in
+		-)
+			failures=0
+			;;
+		"?")
+			anvil_emit_error "$id" "The deferred answer was lost: Emacs no longer knows its request" "$framed"
+			break
+			;;
+		"")
+			failures=$((failures + 1))
+			if [ "$failures" -ge 30 ]; then
+				anvil_emit_error "$id" "Emacs stopped answering the polls of a deferred answer (emacsclient rc=${_anvil_client_rc:-?})" "$framed"
+				break
+			fi
+			;;
+		*)
+			mcp_debug_log "DEFERRED-RESPONSE" "$reply"
+			anvil_emit "$reply" "$framed"
+			break
+			;;
+		esac
+		if [ "$SECONDS" -gt "$deadline" ]; then
+			anvil_call_emacs "(base64-encode-string (anvil-server-deferred-cancel \"$job\") t)" || true
+			anvil_emit_error "$id" "Timed out waiting for a deferred answer" "$framed"
+			break
+		fi
+	done
+	rm -f "$(anvil_hold_name "$id")"
+}
+
+# anvil_cancel_held REQUEST
+#
+# Stops the poller of the request a notifications/cancelled REQUEST names.
+anvil_cancel_held() {
+	local id hold pid job
+	id=$(printf '%s' "$1" \
+		| sed -nE 's/.*"requestId"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*").*/\1/p' \
+		| head -1)
+	[ -n "$id" ] || return 0
+	hold=$(anvil_hold_name "$id")
+	if [ -f "$hold" ]; then
+		read -r pid job <"$hold" || true
+		mcp_debug_log "DEFERRED-CANCEL" "id=$id job=$job"
+		kill "$pid" 2>/dev/null || true
+		rm -f "$hold"
+		anvil_call_emacs "(base64-encode-string (anvil-server-deferred-cancel \"$job\") t)" || true
+	fi
+}
+
+# Process input and print response
+while IFS= read -r line; do
+	# T71: detect framing.  An MCP framed request begins with
+	# `Content-Length:' (case-insensitive); legacy line-delimited
+	# requests begin with `{'.
+	# Strip CR for cross-platform safety.
+	_anvil_first_line="${line%$'\r'}"
+	_anvil_framed=0
+	if [[ "$_anvil_first_line" =~ ^[Cc]ontent-[Ll]ength: ]]; then
+		_anvil_framed=1
+		mcp_debug_log "FRAMING" "Content-Length detected"
+		# Re-read full framed message; reuse the already-consumed line.
+		line=$(anvil_mcp_read_framed_message "$_anvil_first_line") || {
+			mcp_debug_log "FRAMING-ERROR" "rc=$? first=$_anvil_first_line"
+			continue
+		}
+	fi
+
+	# Log the incoming request
+	mcp_debug_log "REQUEST" "$line"
+
+	case "$line" in
+	*'"notifications/cancelled"'*) anvil_cancel_held "$line" ;;
+	esac
+
+	# Base64 encode the raw JSON to avoid emacsclient transport issues
+	# with a specific combination of length, UTF-8 characters, and quoting
+	# that occurs in Test 5 with the Lithuanian letter 'ą'
+	base64_input=$(echo -n "$line" | base64)
+	mcp_debug_log "BASE64-INPUT" "$base64_input"
+
+	# Process JSON-RPC request and return the result with proper UTF-8 encoding
+	# Encode the response to base64 to avoid any character encoding issues
+	# Handle nil responses from notifications by converting to empty string.
+	# `anvil-server-deferrable' tells tools this bridge holds deferred answers.
+	elisp_expr="(base64-encode-string (encode-coding-string (or (let ((anvil-server-deferrable t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\") 'utf-8 t) t)"
+
+	# Get response from emacsclient (with retry across daemon restarts).
+	# The rc is for logging only; an empty response is a soft failure.
+	anvil_call_emacs "$elisp_expr"
+	formatted_response="$_anvil_reply"
 
 	mcp_debug_log "RESPONSE" "$formatted_response"
 
-	# Only output non-empty responses
-	if [ -n "$formatted_response" ]; then
-		if [ "$_anvil_framed" = "1" ]; then
-			# T71: framed output for MCP-compliant clients.
-			anvil_mcp_emit_framed_response "$formatted_response"
-		else
-			# Legacy line-delimited output (dev / test mode).
-			echo "$formatted_response"
-		fi
-	else
+	case "$formatted_response" in
+	anvil-deferred:*)
+		_anvil_deferred="${formatted_response#anvil-deferred:}"
+		_anvil_job="${_anvil_deferred%%:*}"
+		_anvil_seconds="${_anvil_deferred##*:}"
+		[[ "$_anvil_seconds" =~ ^[0-9]+$ ]] || _anvil_seconds=600
+		_anvil_id_field=$(anvil_request_id "$line")
+		mcp_debug_log "DEFERRED" "id=$_anvil_id_field job=$_anvil_job seconds=$_anvil_seconds"
+		anvil_hold_deferred "$_anvil_job" "$_anvil_seconds" "${_anvil_id_field:-null}" "$_anvil_framed" &
+		echo "$! $_anvil_job" >"$(anvil_hold_name "${_anvil_id_field:-null}")"
+		;;
+	?*)
+		# Only output non-empty responses
+		anvil_emit "$formatted_response" "$_anvil_framed"
+		;;
+	*)
 		# VAL-PATCH-ALWAYS-REPLY: empty daemon output for a
 		# request-with-id would otherwise hang the MCP client
 		# forever.  Synthesise a JSON-RPC error so the client
 		# can match the id and move on.  Notifications (no id)
 		# stay silent as the protocol expects.
-		_anvil_id_field=$(printf '%s' "$line" \
-			| sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*"|null).*/\1/p' \
-			| head -1)
+		_anvil_id_field=$(anvil_request_id "$line")
 		if [ -n "$_anvil_id_field" ] && [ "$_anvil_id_field" != "null" ]; then
-			_anvil_synth=$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Bridge synthetic error: daemon returned empty response (emacsclient rc=%s)"}}' "$_anvil_id_field" "${_anvil_client_rc:-?}")
 			mcp_debug_log "SYNTH-ERROR" "id=$_anvil_id_field rc=${_anvil_client_rc:-?}"
-			if [ "$_anvil_framed" = "1" ]; then
-				anvil_mcp_emit_framed_response "$_anvil_synth"
-			else
-				echo "$_anvil_synth"
-			fi
+			anvil_emit_error "$_anvil_id_field" "Bridge synthetic error: daemon returned empty response (emacsclient rc=${_anvil_client_rc:-?})" "$_anvil_framed"
 		fi
-	fi
+		;;
+	esac
 done
 
 # Stop MCP if stop function is provided

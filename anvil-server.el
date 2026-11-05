@@ -1325,8 +1325,10 @@ Returns a JSON-RPC response string for the request."
       (anvil-server--handle-resources-read
        id params method-metrics server-id))
      ((equal method "tools/call")
-      (anvil-server--handle-tools-call
-       id params method-metrics server-id))
+      ;; A handler deferring its answer ends the dispatch with its job.
+      (catch 'anvil-server--deferred
+        (anvil-server--handle-tools-call
+         id params method-metrics server-id)))
      (t
       (anvil-server--jsonrpc-error
        id
@@ -1495,6 +1497,164 @@ Lets `anvil-server-tool-error-hook' callbacks attribute errors to
 the correct tool even when fired from inside
 `anvil-server-with-error-handling', which has no lexical access to
 the dispatcher-level name.")
+
+;;; Deferred results
+;;
+;; A tool whose answer comes later (a turn ending, a process exiting)
+;; must not hold Emacs: the transport serving it holds the request
+;; instead.  The handler returns `anvil-server-defer' with a function
+;; telling whether the answer is there; the dispatcher keeps the request
+;; and answers "anvil-deferred:JOB:SECONDS" in place of a JSON-RPC
+;; response.  The stdio bridge, which binds `anvil-server-deferrable'
+;; as it dispatches, then calls `anvil-server-deferred-poll' every
+;; second or so, each call returning at once, while it goes on serving
+;; other requests, and sends the client the response the poll returns
+;; once the answer is there.  The response is made by dispatching the
+;; request again with the answer in place of the handler's call, so
+;; that it is validated, bounded and encoded as any other.
+
+(defvar anvil-server-deferrable nil
+  "Non-nil while the transport serving the request can wait for its answer.
+The stdio bridge binds it as it dispatches a request: a tool may then
+return `anvil-server-defer' rather than wait.  Other transports leave it
+nil, and a tool answers them at once.  See `anvil-server-can-defer-p'.")
+
+(defvar anvil-server-request-meta nil
+  "The `_meta' of the tools/call request being dispatched, as parsed, or nil.
+An alist, such as ((ai.opencode/sessionID . \"ses_...\")) for a call an
+OpenCode session makes.")
+
+(defcustom anvil-server-deferred-abandon-seconds 120
+  "Seconds after which a deferred answer no one polls is forgotten.
+The bridge polls each second; one that stopped, its client gone, leaves
+its requests to be dropped after this long, their cancel functions run."
+  :type 'integer
+  :group 'anvil-server)
+
+(defconst anvil-server-deferred-max-seconds 7200
+  "Longest a deferred answer may be waited for, in seconds.")
+
+(cl-defstruct (anvil-server--deferral (:constructor anvil-server--deferral-make)
+                                      (:copier nil))
+  "What a tool handler returns to answer later."
+  (poll nil :documentation "Function of no argument returning the answer, or nil while there is none.")
+  (seconds nil :documentation "Seconds after which the transport stops waiting.")
+  (cancel nil :documentation "Function of no argument run when no one waits any more, or nil."))
+
+(defvar anvil-server--deferred (make-hash-table :test #'equal)
+  "Deferred requests by job, each a plist.
+:request is the JSON-RPC text, :server-id its server, :deferral the
+`anvil-server--deferral', :polled when it was last polled.")
+
+(defvar anvil-server--deferred-counter 0
+  "Counter of the jobs of deferred requests.")
+
+(defvar anvil-server--current-request nil
+  "The request being processed, as (JSON-STRING . SERVER-ID), or nil.")
+
+(defvar anvil-server--settled nil
+  "The answer of a deferred request being dispatched again, or nil.
+It is (:value . VALUE) or (:error ERROR-SYMBOL . DATA).")
+
+(defun anvil-server-can-defer-p ()
+  "Return non-nil when the request being dispatched may be answered later.
+A tool handler may then return `anvil-server-defer'; otherwise it must
+answer at once."
+  (and anvil-server-deferrable anvil-server--current-request t))
+
+(cl-defun anvil-server-defer (poll &key (seconds 600) cancel)
+  "Return what a tool handler returns to answer later, through POLL.
+POLL is a function of no argument, called from the transport's polls,
+each of which returns at once: it returns nil while the answer is not
+there, else the answer, what the handler would have returned, and may
+signal an error, which the client gets as the handler's.  SECONDS
+bounds how long the transport waits, past which it answers an error:
+POLL should answer before, telling the time ran out.  CANCEL, a
+function of no argument, is called when no one waits for the answer
+any more.  Only while `anvil-server-can-defer-p'."
+  (anvil-server--deferral-make
+   :poll poll
+   :seconds (max 1 (min anvil-server-deferred-max-seconds (truncate seconds)))
+   :cancel cancel))
+
+(defun anvil-server--deferred-cancel (job)
+  "Forget the deferred request JOB, running its cancel function."
+  (when-let* ((entry (gethash job anvil-server--deferred)))
+    (remhash job anvil-server--deferred)
+    (when-let* ((cancel (anvil-server--deferral-cancel (plist-get entry :deferral))))
+      (condition-case err
+          (funcall cancel)
+        (error (message "anvil-server: cancelling %s: %s" job
+                        (anvil-server--condition-message err)))))))
+
+(defun anvil-server--deferred-sweep ()
+  "Forget the deferred requests no one polled for a while."
+  (let ((now (float-time))
+        (stale nil))
+    (maphash (lambda (job entry)
+               (when (> (- now (plist-get entry :polled)) anvil-server-deferred-abandon-seconds)
+                 (push job stale)))
+             anvil-server--deferred)
+    (mapc #'anvil-server--deferred-cancel stale)))
+
+(defun anvil-server--maybe-defer (value)
+  "Return VALUE, a handler's, unless it defers the answer.
+A deferral is kept with the request being processed, and the dispatch
+ends with the deferred answer's job for the transport (see
+`anvil-server-deferred-poll')."
+  (if (not (anvil-server--deferral-p value))
+      value
+    (unless (anvil-server-can-defer-p)
+      (signal 'anvil-server-tool-error
+              (list "This tool answers later, which this transport cannot wait for")))
+    (anvil-server--deferred-sweep)
+    (let ((job (format "d%d-%d" (cl-incf anvil-server--deferred-counter)
+                       (truncate (float-time)))))
+      (puthash job (list :request (car anvil-server--current-request)
+                         :server-id (cdr anvil-server--current-request)
+                         :deferral value
+                         :polled (float-time))
+               anvil-server--deferred)
+      (throw 'anvil-server--deferred
+             (format "anvil-deferred:%s:%d" job (anvil-server--deferral-seconds value))))))
+
+(defun anvil-server--settled-value ()
+  "Return the answer of the deferred request dispatched again, or signal its error."
+  (let ((settled anvil-server--settled))
+    (pcase settled
+      (`(:value . ,value) value)
+      (`(:error ,symbol . ,data) (signal symbol data)))))
+
+(defun anvil-server-deferred-poll (job)
+  "Return the response to the deferred request JOB once it is there.
+Return \"-\" while it is not, and \"?\" when JOB is unknown, as after
+Emacs restarted.  The response is the JSON-RPC text the request
+answers, made by dispatching it again with the answer in place of its
+handler's call.  The bridge calls it; it never waits."
+  (let ((entry (gethash job anvil-server--deferred)))
+    (anvil-server--deferred-sweep)
+    (cond
+     ((not entry) "?")
+     (t
+      (plist-put entry :polled (float-time))
+      (let* ((poll (anvil-server--deferral-poll (plist-get entry :deferral)))
+             (settled (condition-case err
+                          (when-let* ((value (funcall poll)))
+                            (cons :value value))
+                        (error (cons :error err)))))
+        (if (not settled)
+            "-"
+          (remhash job anvil-server--deferred)
+          (let ((anvil-server--settled settled)
+                (anvil-server-deferrable nil))
+            (or (anvil-server-process-jsonrpc (plist-get entry :request)
+                                              (plist-get entry :server-id))
+                ""))))))))
+
+(defun anvil-server-deferred-cancel (job)
+  "Forget the deferred request JOB, whose client stopped waiting; return \"ok\"."
+  (anvil-server--deferred-cancel job)
+  "ok")
 
 (defun anvil-server--run-tool-error-hook (err tool-name source)
   "Run `anvil-server-tool-error-hook' with ERR / TOOL-NAME / SOURCE.
@@ -1821,11 +1981,20 @@ virtual server-ids share the same handler pool."
                                         (intern param-name) tool-args))))
                                 (push value arg-values)))))
                         (let ((final-args (nreverse arg-values))
-                              (anvil-server--current-tool-name tool-name))
-                          (if (plist-get tool :offload)
-                              (anvil-server--offload-apply
-                               tool handler final-args)
-                            (apply handler final-args)))))
+                              (anvil-server--current-tool-name tool-name)
+                              (anvil-server-request-meta
+                               (let ((meta (alist-get '_meta params)))
+                                 (and (listp meta) meta))))
+                          (cond
+                           ;; A deferred request dispatched again with its answer.
+                           (anvil-server--settled
+                            (anvil-server--settled-value))
+                           ((plist-get tool :offload)
+                            (anvil-server--offload-apply
+                             tool handler final-args))
+                           (t
+                            (anvil-server--maybe-defer
+                             (apply handler final-args)))))))
                      ;; `anvil-server-encode-handler' marks tools that want
                      ;; transport-level JSON encoding while their raw
                      ;; handler keeps returning rich Lisp data.
@@ -2253,6 +2422,7 @@ See also: `anvil-server-process-jsonrpc-parsed'"
           (nelisp--write-stderr-line "[PJ] dispatch-start"))
         (let ((anvil-server--current-request-id
                (when json-object (cdr (assq 'id json-object))))
+              (anvil-server--current-request (cons json-string server-id))
               (dispatch
                (lambda ()
                  (condition-case err
