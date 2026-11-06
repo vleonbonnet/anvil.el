@@ -84,6 +84,14 @@ fi
 ANVIL_EMACSCLIENT_RETRY_MAX=${ANVIL_EMACSCLIENT_RETRY_MAX:-60}
 ANVIL_EMACSCLIENT_RETRY_DELAY_MS=${ANVIL_EMACSCLIENT_RETRY_DELAY_MS:-100}
 
+# emacsclient's complaints when no server answers yet.  On MS-Windows the
+# server is reached over TCP: a missing server file reads "error accessing
+# server file", and a refused connection "connect: " followed by the
+# system's message, which is localized; "No socket or alternate editor"
+# ends either failure.
+_anvil_retry_pattern="can't find socket|Connection refused|server.*not.*running|No such file or directory"
+_anvil_retry_pattern+="|: connect: |error accessing server file|No socket or alternate editor"
+
 # Keep the fallback self-contained: install.sh and install.ps1 deploy only
 # this bridge script.  read's here-document redirection is local to this
 # builtin, so emacsclient retains the bridge's original stdin.
@@ -203,7 +211,7 @@ anvil_emacsclient_retry() {
 			return 0
 		fi
 		if [ -s "$stderr_file" ] \
-			&& grep -qE "can't find socket|Connection refused|server.*not.*running|No such file or directory" "$stderr_file"; then
+			&& grep -qE "$_anvil_retry_pattern" "$stderr_file"; then
 			attempt=$((attempt + 1))
 			if [ "$attempt" -ge "$ANVIL_EMACSCLIENT_RETRY_MAX" ]; then
 				mcp_debug_log "RETRY-EXHAUSTED" "attempts=$attempt max=$ANVIL_EMACSCLIENT_RETRY_MAX rc=$rc"

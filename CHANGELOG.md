@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Deferred tool answers: a handler may return `anvil-server-defer` with a function telling whether its answer is there, rather than wait in Emacs, while `anvil-server-can-defer-p`.  The stdio bridge, which binds `anvil-server-deferrable`, holds the request and polls `anvil-server-deferred-poll` once a second, each poll returning at once, and answers the other requests meanwhile; a request the client cancels stops its poller.  Handlers read the request's `_meta`, such as the calling OpenCode session, from `anvil-server-request-meta`.
 
+### Fixed
+
+- The stdio bridge retries emacsclient on MS-Windows too while no server answers yet, as when Emacs restarts.  There emacsclient reaches the server over TCP and reports "error accessing server file" or "connect: " followed by the system's localized message, never "Connection refused", so the bridge failed the request at once.
+
 ## [1.4.1] - 2026-10-04
 
 ### Fixed
