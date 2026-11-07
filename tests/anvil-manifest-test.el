@@ -625,6 +625,28 @@ and sees only ultra tools while `emacs-eval' still shows everything."
     (should-not (string-match-p "Long parameter description" trimmed))
     (should-not (string-match-p "second" trimmed))))
 
+(ert-deftest anvil-manifest-test-schema-trimmer-keeps-annotations ()
+  "A trimmed fragment still tells clients the tool is read-only."
+  (let* ((tool
+          '(:description "Reads\nmore"
+            :schema ((type . "object"))
+            :title "Reader"
+            :read-only t))
+         (default (anvil-server--build-tool-fragment
+                   "stub-reader" (plist-get tool :description)
+                   (plist-get tool :schema)
+                   (anvil-server--tool-annotations tool)))
+         (anvil-manifest-profile 'dynamic)
+         (anvil-manifest-attention-query "http fetch")
+         (anvil-manifest-schema-trim-enabled t)
+         (trimmed (anvil-manifest--tool-fragment
+                   "stub-reader" tool "default" default))
+         (annotations (alist-get 'annotations
+                                 (json-read-from-string trimmed))))
+    (should-not (string-match-p "more" trimmed))
+    (should (eq t (alist-get 'readOnlyHint annotations)))
+    (should (equal "Reader" (alist-get 'title annotations)))))
+
 (ert-deftest anvil-manifest-test-lru-warms-recent-tool ()
   "Doc44 Phase 2c keeps recently used tools focused."
   (let ((anvil-manifest--warm-tools nil)

@@ -774,7 +774,10 @@ trimmed schema for the rest."
        tool-id
        (anvil-manifest--short-description
         (plist-get tool :description))
-       (anvil-manifest--trim-schema (plist-get tool :schema)))
+       (anvil-manifest--trim-schema (plist-get tool :schema))
+       ;; Trimming keeps the annotations: a client may refuse a tool it
+       ;; cannot see is read-only.
+       (anvil-server--tool-annotations tool))
     default-fragment))
 
 ;;; manifest-cost handler

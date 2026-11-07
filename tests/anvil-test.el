@@ -207,6 +207,124 @@ MCP Parameters:
       (remhash server-id anvil-server--tools)
       (anvil-server--tools-list-cache-invalidate server-id))))
 
+(defun anvil-test--fragment-annotations (fragment)
+  "Return the annotations alist of tools/list FRAGMENT, or nil."
+  (alist-get 'annotations (json-read-from-string fragment)))
+
+(ert-deftest anvil-test-tool-fragment-carries-annotations ()
+  "A fragment encodes the title and read-only flag as mcp-server-lib does."
+  (let ((schema '((type . "object"))))
+    (should-not (anvil-test--fragment-annotations
+                 (anvil-server--build-tool-fragment "t" "d" schema)))
+    (should (eq t (alist-get 'readOnlyHint
+                             (anvil-test--fragment-annotations
+                              (anvil-server--build-tool-fragment
+                               "t" "d" schema '(:read-only t))))))
+    ;; An explicit nil is advertised as false, not left out.
+    (should (eq :json-false
+                (alist-get 'readOnlyHint
+                           (anvil-test--fragment-annotations
+                            (anvil-server--build-tool-fragment
+                             "t" "d" schema '(:read-only nil))))))
+    (should (equal "Title \"quoted\""
+                   (alist-get 'title
+                              (anvil-test--fragment-annotations
+                               (anvil-server--build-tool-fragment
+                                "t" "d" schema
+                                '(:title "Title \"quoted\""))))))
+    (should (equal '(:title "T" :read-only t)
+                   (anvil-server--tool-annotations
+                    '(:id "x" :title "T" :read-only yes))))
+    (should (equal '(:read-only nil)
+                   (anvil-server--tool-annotations '(:id "x" :read-only nil))))
+    (should-not (anvil-server--tool-annotations '(:id "x")))))
+
+(ert-deftest anvil-test-tools-list-advertises-read-only-hint ()
+  "tools/list marks tools registered :read-only, warm schema cache included."
+  (defun anvil-test--read-only-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-read-only-hint")
+         (cache-file (make-temp-file "anvil-read-only-hint-"))
+         (hints
+          (lambda ()
+            (let* ((response (json-read-from-string
+                              (anvil-server--handle-tools-list "1" server-id)))
+                   (tools (alist-get 'tools (alist-get 'result response))))
+              (mapcar (lambda (tool)
+                        (cons (alist-get 'name tool)
+                              (alist-get 'readOnlyHint
+                                         (alist-get 'annotations tool))))
+                      tools)))))
+    (unwind-protect
+        (let ((anvil-server-schema-cache-file cache-file)
+              (anvil-server--schema-cache nil)
+              (anvil-server--schema-cache-loaded nil))
+          (anvil-server-register-tool #'anvil-test--read-only-tool
+                                      :id "reads" :description "Reads"
+                                      :read-only t :server-id server-id)
+          (anvil-server-register-tool #'anvil-test--read-only-tool
+                                      :id "writes" :description "Writes"
+                                      :read-only nil :server-id server-id)
+          (anvil-server-register-tool #'anvil-test--read-only-tool
+                                      :id "unsaid" :description "Unsaid"
+                                      :server-id server-id)
+          (let ((advertised (funcall hints)))
+            (should (eq t (cdr (assoc "reads" advertised))))
+            (should (eq :json-false (cdr (assoc "writes" advertised))))
+            (should (null (cdr (assoc "unsaid" advertised)))))
+          ;; Neither a cached fragment nor a cached list outlives a change
+          ;; of the flag: the list above is cached under SERVER->SERVER.
+          (anvil-server-unregister-tool "writes" server-id)
+          (setq anvil-server--schema-cache nil
+                anvil-server--schema-cache-loaded nil)
+          (anvil-server-register-tool #'anvil-test--read-only-tool
+                                      :id "writes" :description "Writes"
+                                      :read-only t :server-id server-id)
+          (should (eq t (cdr (assoc "writes" (funcall hints))))))
+      (remhash server-id anvil-server--tools)
+      (anvil-server--tools-list-cache-invalidate server-id)
+      (when (file-exists-p cache-file)
+        (delete-file cache-file)))))
+
+(ert-deftest anvil-test-lazy-placeholder-keeps-annotations ()
+  "A placeholder from the schema cache carries its tool's annotations."
+  (let* ((server-id "anvil-test-lazy-annotations")
+         (cache-file (make-temp-file "anvil-lazy-annotations-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "(setq anvil-server--schema-cache-file-data '"
+            (prin1-to-string
+             (list :version anvil-server--schema-cache-version
+                   :entries
+                   (list
+                    (list :id "lazy-reader"
+                          :signature "sig"
+                          :schema '((type . "object"))
+                          :fragment (anvil-server--build-tool-fragment
+                                     "lazy-reader" "Lazy" '((type . "object"))
+                                     '(:read-only t))
+                          :annotations '(:read-only t)))))
+            ")\n")
+           nil cache-file)
+          (let ((anvil-server-schema-cache-file cache-file)
+                (anvil-server--schema-cache nil)
+                (anvil-server--schema-cache-loaded nil))
+            (anvil-server-register-cached-tool-fragments
+             server-id `(("lazy-reader" . ,#'ignore)))
+            (let ((tool (gethash "lazy-reader"
+                                 (anvil-server--get-server-tools server-id))))
+              (should (plist-member tool :read-only))
+              (should (eq t (plist-get tool :read-only)))
+              (should (equal '(:read-only t)
+                             (anvil-server--tool-annotations tool))))))
+      (remhash server-id anvil-server--tools)
+      (anvil-server--tools-list-cache-invalidate server-id)
+      (when (file-exists-p cache-file)
+        (delete-file cache-file)))))
+
 (ert-deftest anvil-test-schema-cache-signature-does-not-read-docstring ()
   "Signature construction must be stable before cache lookup."
   (cl-letf (((symbol-function 'documentation)

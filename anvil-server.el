@@ -265,8 +265,10 @@ Keys are server-id strings, values are hash tables of URI to resource-data.")
   "Hash table of registered MCP resource templates by server.
 Keys are server-id strings, values are hash tables of template to template-data.")
 
-(defvar anvil-server--schema-cache-version 1
-  "Version marker for `anvil-server-schema-cache-file'.")
+(defconst anvil-server--schema-cache-version 2
+  "Version marker for `anvil-server-schema-cache-file'.
+Version 2 fragments carry each tool's annotations, which version 1
+fragments lacked.")
 
 (defvar anvil-server--schema-cache nil
   "In-memory list of persisted schema cache entries.")
@@ -373,13 +375,42 @@ Hand-built to avoid `json-encode' cumulative degradation."
       (push "}" parts)
       (apply #'concat (nreverse parts)))))
 
-(defun anvil-server--build-tool-fragment (id description schema)
+(defun anvil-server--tool-annotations (properties)
+  "Return the annotations of a tool registered with PROPERTIES.
+The result is a plist holding `:title' when PROPERTIES has one, and
+`:read-only' (t or nil) whenever PROPERTIES specifies it, nil
+included, as `anvil-server--build-tool-fragment' expects."
+  (append (when (plist-get properties :title)
+            (list :title (plist-get properties :title)))
+          (when (plist-member properties :read-only)
+            (list :read-only (and (plist-get properties :read-only) t)))))
+
+(defun anvil-server--build-tool-fragment
+    (id description schema &optional annotations)
   "Build a tools/list JSON fragment for one tool.
-Hand-built; never calls `json-encode'."
-  (concat "{\"name\":" (anvil-server--js-string id)
-          ",\"description\":" (anvil-server--js-string description)
-          ",\"inputSchema\":" (anvil-server--js-schema schema)
-          "}"))
+ANNOTATIONS is a plist as `anvil-server--tool-annotations' returns:
+`:title' becomes the annotation title and a `:read-only' key, nil
+included, becomes `readOnlyHint', as `mcp-server-lib' encodes them.
+Clients act on the hint: Claude Code's plan mode runs only tools
+marked read-only.  Hand-built; never calls `json-encode'."
+  (let ((fields nil))
+    (when (plist-get annotations :title)
+      (push (concat "\"title\":"
+                    (anvil-server--js-string (plist-get annotations :title)))
+            fields))
+    (when (plist-member annotations :read-only)
+      (push (concat "\"readOnlyHint\":"
+                    (if (plist-get annotations :read-only) "true" "false"))
+            fields))
+    (concat "{\"name\":" (anvil-server--js-string id)
+            ",\"description\":" (anvil-server--js-string description)
+            ",\"inputSchema\":" (anvil-server--js-schema schema)
+            (if fields
+                (concat ",\"annotations\":{"
+                        (mapconcat #'identity (nreverse fields) ",")
+                        "}")
+              "")
+            "}")))
 
 (defun anvil-server--prin1-to-string (object)
   "Return the `prin1' representation of OBJECT as a string.
@@ -392,11 +423,11 @@ corrupts the MCP framing channel and leaves the buffer empty."
     (prin1-to-string object)))
 
 (defun anvil-server--schema-cache-signature
-    (raw-handler arglist description provided-schema)
+    (raw-handler arglist description provided-schema &optional annotations)
   "Return a persistent cache signature for one tool registration.
-Keys on exactly the inputs the generated schema depends on: the
-handler's ARGLIST, the tool DESCRIPTION, and any
-explicitly-PROVIDED-SCHEMA.
+Keys on exactly the inputs the generated schema and fragment depend
+on: the handler's ARGLIST, the tool DESCRIPTION, any
+explicitly-PROVIDED-SCHEMA, and the tool's ANNOTATIONS.
 
 Deliberately does NOT serialize the live function object.  On
 standalone NeLisp the handler is a `(closure ENV ARGS BODY)' whose
@@ -418,7 +449,8 @@ parameters exist."
            ;; Preserve the old standalone cache signature shape.  Earlier
            ;; standalone-generated cache files already stored `:doc nil'.
            :doc nil
-           :schema provided-schema))))
+           :schema provided-schema
+           :annotations annotations))))
 
 (defvar anvil-server--schema-cache-file-data nil
   "Scratch binding set by loading `anvil-server-schema-cache-file'.
@@ -483,14 +515,16 @@ empty), so the cache round-trips purely through string ops + `load'
         (throw 'found entry)))
     nil))
 
-(defun anvil-server--schema-cache-put (id signature schema fragment)
-  "Persist SCHEMA and FRAGMENT for ID and SIGNATURE."
+(defun anvil-server--schema-cache-put
+    (id signature schema fragment &optional annotations)
+  "Persist SCHEMA, FRAGMENT and ANNOTATIONS for ID and SIGNATURE."
   (anvil-server--schema-cache-load)
   (setq anvil-server--schema-cache
         (cons (list :id id
                     :signature signature
                     :schema schema
-                    :fragment fragment)
+                    :fragment fragment
+                    :annotations annotations)
               (cl-remove-if
                (lambda (entry)
                  (and (equal id (plist-get entry :id))
@@ -519,13 +553,16 @@ in `tools/list' immediately.  The real module is loaded on first
                    (stringp fragment)
                    loader
                    (not (gethash id tools-table)))
+          ;; The annotations ride along so a fragment rebuilt from the
+          ;; placeholder, as `anvil-manifest' trims them, keeps its hints.
           (puthash id
-                   (list :id id
-                         :description ""
-                         :schema (plist-get entry :schema)
-                         :json-fragment fragment
-                         :lazy-placeholder t
-                         :lazy-loader loader)
+                   (append (list :id id
+                                 :description ""
+                                 :schema (plist-get entry :schema)
+                                 :json-fragment fragment
+                                 :lazy-placeholder t
+                                 :lazy-loader loader)
+                           (plist-get entry :annotations))
                    tools-table)
           (push fragment fragments)
           (setq count (1+ count)))))
@@ -2711,6 +2748,7 @@ See also:
          (title (plist-get properties :title))
          (provided-schema (plist-get properties :schema))
          (read-only (plist-get properties :read-only))
+         (annotations (anvil-server--tool-annotations properties))
          (server-id (or (plist-get properties :server-id) "default"))
          (tools-table (anvil-server--get-server-tools server-id)))
     ;; Error checking for required properties.
@@ -2745,7 +2783,7 @@ See also:
              (encode-result (plist-get handler-meta :encode-result))
              (schema-cache-signature
               (anvil-server--schema-cache-signature
-               raw-handler arglist description provided-schema))
+               raw-handler arglist description provided-schema annotations))
              (schema-cache-entry
               (anvil-server--schema-cache-get id schema-cache-signature))
              (_cache-log
@@ -2814,13 +2852,14 @@ See also:
                (or (and schema-cache-entry
                         (plist-get schema-cache-entry :fragment))
                    (anvil-server--build-tool-fragment
-                    id description (plist-get tool :schema)))))
+                    id description (plist-get tool :schema) annotations))))
           (setq tool (plist-put tool :json-fragment fragment)))
         (unless schema-cache-entry
           (anvil-server--schema-cache-put
            id schema-cache-signature
            (plist-get tool :schema)
-           (plist-get tool :json-fragment)))
+           (plist-get tool :json-fragment)
+           annotations))
         ;; Register the tool
         (anvil-server--ref-counted-register id tool tools-table)
         ;; Perf (2026-05-11): tools/list response is cached per server-id;
