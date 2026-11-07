@@ -178,6 +178,35 @@ MCP Parameters:
       (when (file-exists-p cache-file)
         (delete-file cache-file)))))
 
+(ert-deftest anvil-test-tools-list-follows-registration-after-caching ()
+  "A cached tools/list never hides a later registration or unregistration."
+  (defun anvil-test--listed-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-list-cache")
+         (names
+          (lambda ()
+            (mapcar (lambda (tool) (alist-get 'name tool))
+                    (alist-get 'tools
+                               (alist-get 'result
+                                          (json-read-from-string
+                                           (anvil-server--handle-tools-list
+                                            "1" server-id))))))))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool #'anvil-test--listed-tool
+                                      :id "first" :description "First"
+                                      :server-id server-id)
+          (should (equal '("first") (funcall names)))
+          (anvil-server-register-tool #'anvil-test--listed-tool
+                                      :id "second" :description "Second"
+                                      :server-id server-id)
+          (should (member "second" (funcall names)))
+          (anvil-server-unregister-tool "first" server-id)
+          (should (equal '("second") (funcall names))))
+      (remhash server-id anvil-server--tools)
+      (anvil-server--tools-list-cache-invalidate server-id))))
+
 (ert-deftest anvil-test-schema-cache-signature-does-not-read-docstring ()
   "Signature construction must be stable before cache lookup."
   (cl-letf (((symbol-function 'documentation)

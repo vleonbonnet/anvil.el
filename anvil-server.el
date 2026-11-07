@@ -574,17 +574,30 @@ in `tools/list' immediately.  The real module is loaded on first
 ;; not the full JSON-RPC wrapper, because the wrapper's `id' varies per
 ;; call.  The wrapper concat is constant-time string assembly.
 (defvar anvil-server--tools-list-cache (make-hash-table :test 'equal)
-  "Hash table mapping server-id → JSON string of cached `result' object.
+  "Hash table mapping VIRTUAL->RESOLVED server ids → cached `result' JSON.
 The stored string is the JSON-encoded `((tools . [...]))' alist, with no
-outer JSON-RPC wrapper.  Cleared per server-id by
+outer JSON-RPC wrapper.  Cleared per resolved server-id by
 `anvil-server--tools-list-cache-invalidate' when tools register /
 unregister.")
 
 (defun anvil-server--tools-list-cache-invalidate (&optional server-id)
-  "Drop the tools/list cache entry for SERVER-ID (or every entry if nil)."
-  (if server-id
-      (remhash server-id anvil-server--tools-list-cache)
-    (clrhash anvil-server--tools-list-cache)))
+  "Drop the tools/list cache entries listing SERVER-ID's tools.
+`anvil-server--handle-tools-list' keys an entry VIRTUAL->RESOLVED, so
+every key ending in ->SERVER-ID goes, with the bare SERVER-ID key the
+cached-fragment preload uses; nil SERVER-ID drops every entry."
+  (if (null server-id)
+      (clrhash anvil-server--tools-list-cache)
+    (let* ((suffix (concat "->" server-id))
+           (size (length suffix))
+           (stale nil))
+      (maphash (lambda (key _value)
+                 (when (or (equal key server-id)
+                           (and (>= (length key) size)
+                                (string= (substring key (- size)) suffix)))
+                   (push key stale)))
+               anvil-server--tools-list-cache)
+      (dolist (key stale)
+        (remhash key anvil-server--tools-list-cache)))))
 
 (defun anvil-server--jsonrpc-response-from-result-json (id result-json)
   "Build a JSON-RPC response by wrapping a pre-encoded RESULT-JSON string.
