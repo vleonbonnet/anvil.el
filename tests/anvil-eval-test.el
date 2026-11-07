@@ -298,7 +298,58 @@ points at a source dir, the resolver picks it up."
     (should-error (anvil-eval--nelisp "(+ 1 2)") :type 'error)))
 
 
+;;;; --- read-only eval -----------------------------------------------------
+
+(defvar anvil-eval-test--ran nil
+  "Set by an expression the read-only eval must refuse before running.")
+
+(defun anvil-eval-test--read-error (expression)
+  "Return the error message `emacs-eval-read' gives EXPRESSION, or nil."
+  (condition-case err
+      (progn (anvil-eval--read expression) nil)
+    (error (error-message-string err))))
+
+(ert-deftest anvil-eval-test-read-evaluates-queries ()
+  "Expressions naming no writing function evaluate as in emacs-eval."
+  (should (equal "3" (anvil-eval--read "(+ 1 2)")))
+  ;; A name containing a refused one is a different symbol.
+  (should (equal "t" (anvil-eval--read "(fboundp 'insert-file-contents)")))
+  ;; Strings and comments never count.
+  (should (equal "18" (anvil-eval--read "(length \"insert delete-file\") ; save-buffer")))
+  ;; Circular structure is walked once.
+  (should (equal "1" (anvil-eval--read "(let ((x '#1=(a . #1#))) (ignore x) 1)"))))
+
+(ert-deftest anvil-eval-test-read-refuses-writing-functions ()
+  "Writing functions are refused wherever they appear, quoted included."
+  (dolist (case '(("(with-temp-buffer (insert \"x\"))" . "insert")
+                  ("(mapc #'delete-file nil)" . "delete-file")
+                  ("(funcall 'save-buffer)" . "save-buffer")
+                  ("[a (shell-command \"ls\")]" . "shell-command")
+                  ("(when nil (anvil-file-replace-string \"a\" \"b\" \"c\"))" . "anvil-file-replace-string")
+                  ("(progn (write-region \"\" nil \"x\") (call-process \"ls\"))" . "call-process, write-region")))
+    (let ((message (anvil-eval-test--read-error (car case))))
+      (should message)
+      (should (string-match-p (regexp-quote (cdr case)) message))))
+  ;; Refused before anything runs.
+  (let ((anvil-eval-test--ran nil))
+    (should (anvil-eval-test--read-error "(progn (setq anvil-eval-test--ran t) (delete-file \"x\"))"))
+    (should-not anvil-eval-test--ran)))
+
 ;;;; --- tool registration --------------------------------------------------
+
+(ert-deftest anvil-eval-test-read-only-tools-registered ()
+  "The read-only eval and the job queries are registered :read-only t."
+  (unwind-protect
+      (progn
+        (anvil-eval-enable)
+        (let ((tools (anvil-server--get-server-tools anvil-eval--server-id)))
+          (dolist (id '("emacs-eval-read" "emacs-eval-result" "emacs-eval-jobs"))
+            (should (eq t (plist-get (gethash id tools) :read-only))))
+          (should-not (plist-get (gethash "emacs-eval" tools) :read-only))))
+    (anvil-eval-disable)
+    (should-not (gethash "emacs-eval-read"
+                         (anvil-server--get-server-tools
+                          anvil-eval--server-id)))))
 
 (ert-deftest anvil-eval-test-nelisp-tool-registered ()
   "`anvil-eval-enable' registers a `nelisp-eval' tool that

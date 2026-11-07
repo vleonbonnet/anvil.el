@@ -13,6 +13,8 @@
 
 ;; Provides sync and async Elisp evaluation as MCP tools.
 ;; - `emacs-eval' — synchronous evaluation (< timeout)
+;; - `emacs-eval-read' — synchronous evaluation of an expression that
+;;   names no writing function, marked read-only for clients' plan modes
 ;; - `emacs-eval-async' — fire-and-forget, returns job ID
 ;; - `emacs-eval-result' — poll async job result
 ;; - `emacs-eval-jobs' — list all async jobs
@@ -47,6 +49,29 @@ to `emacs-eval', `emacs-eval-async' results and `nelisp-eval'.
 Longer results are cut and end with a trailer stating the original
 length.  Nil disables the cap."
   :type '(choice (const :tag "Unlimited" nil) integer)
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-read-refused-functions
+  '(write-region write-file append-to-file with-temp-file
+    save-buffer basic-save-buffer save-some-buffers org-save-all-org-buffers
+    delete-file rename-file copy-file copy-directory delete-directory
+    make-directory make-symbolic-link add-name-to-file set-file-modes
+    set-file-times
+    insert insert-before-markers erase-buffer delete-region delete-char
+    delete-line replace-match replace-string replace-regexp
+    org-babel-tangle org-babel-tangle-file org-babel-execute-src-block
+    org-babel-execute-buffer org-babel-execute-subtree
+    shell-command async-shell-command shell-command-to-string
+    shell-command-on-region call-process call-process-region
+    call-process-shell-command process-file process-file-shell-command
+    start-process start-file-process start-process-shell-command
+    make-process compile eshell-command)
+  "Functions an `emacs-eval-read' expression may not name.
+The expression is refused when one of these symbols, or one starting
+with `anvil-file-', appears in it outside strings and comments, quoted
+or not.  This checks the expression as written and is not a sandbox: a
+function it calls may still write."
+  :type '(repeat symbol)
   :group 'anvil-eval)
 
 (defcustom anvil-eval-org-fast-mode t
@@ -164,6 +189,55 @@ Only available in Emacs with thread support.")
    (let* ((form (car (read-from-string expression)))
           (result (eval form t)))
      (anvil-eval--bound-result (format "%S" result)))))
+
+;;; Read-only eval tool
+
+(defun anvil-eval--read-refused (form)
+  "Return the functions FORM names that `emacs-eval-read' refuses, sorted.
+Walks every symbol of FORM as read, so strings and comments never
+count and quoted symbols do.  Shared and circular structure is walked
+once."
+  (let ((seen (make-hash-table :test 'eq))
+        (found nil))
+    (cl-labels
+        ((walk (object)
+           (cond
+            ((and object (symbolp object))
+             (when (or (memq object anvil-eval-read-refused-functions)
+                       (string-prefix-p "anvil-file-" (symbol-name object)))
+               (cl-pushnew object found)))
+            ((consp object)
+             (while (and (consp object) (not (gethash object seen)))
+               (puthash object t seen)
+               (walk (car object))
+               (setq object (cdr object)))
+             (unless (consp object)
+               (walk object)))
+            ((or (vectorp object) (recordp object))
+             (dotimes (index (length object))
+               (walk (aref object index)))))))
+      (walk form))
+    (sort found (lambda (a b) (string< (symbol-name a) (symbol-name b))))))
+
+(defun anvil-eval--read (expression)
+  "Evaluate EXPRESSION when it names no function that writes.
+
+  Refuses an EXPRESSION naming any of `anvil-eval-read-refused-functions'
+  or an `anvil-file-' function, outside strings and comments.  The tool
+  is marked read-only, so clients that allow only read-only tools, such
+  as Claude Code's plan mode, can still query Emacs.
+
+  MCP Parameters:
+    expression - Emacs Lisp expression that only reads (string, required)
+                 Example: \"(buffer-list)\""
+  (anvil-server-with-error-handling
+   (let* ((form (car (read-from-string expression)))
+          (refused (anvil-eval--read-refused form)))
+     (when refused
+       (anvil-server-tool-throw
+        (format "emacs-eval-read refuses an expression naming %s, which may write; query without it, or use emacs-eval once writing is allowed"
+                (mapconcat #'symbol-name refused ", "))))
+     (anvil-eval--bound-result (format "%S" (eval form t))))))
 
 ;;; NeLisp eval tool (pure Elisp REPL)
 
@@ -516,6 +590,20 @@ Use for quick operations (< 30s): querying state, small edits,
 reading data. For heavy operations use emacs-eval-async instead."
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool
+   #'anvil-eval--read
+   :id "emacs-eval-read"
+   :intent '(eval)
+   :layer 'dev
+   :description
+   "Evaluate an Emacs Lisp expression that only reads, and return the result.
+Marked read-only, so it runs where a client allows only read-only tools,
+such as Claude Code's plan mode.  An expression naming a function that
+writes files, edits buffers or runs processes (insert, save-buffer,
+write-region, delete-file, shell-command, ...) is refused; use
+emacs-eval for those once writing is allowed."
+   :read-only t
+   :server-id anvil-eval--server-id)
+  (anvil-server-register-tool
    #'anvil-eval--async
    :id "emacs-eval-async"
    :intent '(eval)
@@ -535,6 +623,7 @@ Retrieve result with emacs-eval-result tool using the returned job ID."
    "Get the result of an async job started by emacs-eval-async.
 Returns status (running/done/error), age, queue wait, runtime, and result.
 Poll this until status is 'done' or 'error'."
+   :read-only t
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool
    #'anvil-eval--jobs
@@ -544,6 +633,7 @@ Poll this until status is 'done' or 'error'."
    :description
    "List all async jobs and their statuses.
 Useful for checking what's running or debugging stuck jobs."
+   :read-only t
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool
    #'anvil-eval--nelisp
@@ -567,6 +657,7 @@ NeLisp globals across calls, so it behaves as a practical MCP REPL."
 (defun anvil-eval-disable ()
   "Unregister eval tools and remove advice."
   (anvil-server-unregister-tool "emacs-eval" anvil-eval--server-id)
+  (anvil-server-unregister-tool "emacs-eval-read" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-async" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-result" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-jobs" anvil-eval--server-id)
