@@ -586,6 +586,7 @@ commit 683efb8de5), shifting `dontkill' from index 4 to index 5."
    :layer 'dev
    :description
    "Evaluate Emacs Lisp expression synchronously and return the result.
+For read-only queries, especially in Plan mode, use emacs-eval-read instead.
 Use for quick operations (< 30s): querying state, small edits,
 reading data. For heavy operations use emacs-eval-async instead."
    :server-id anvil-eval--server-id)
