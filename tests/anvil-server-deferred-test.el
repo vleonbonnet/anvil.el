@@ -186,7 +186,17 @@ Each response is a line; those read are removed from BUFFER."
     (ert-skip "bash, emacsclient or base64 unavailable"))
   (anvil-server-deferred-test--with-tools
     (let* ((server-socket-dir (make-temp-file "anvil-deferred-socket" t))
+           ;; Where a server reached over TCP, as on MS-Windows, writes its file.
+           (server-auth-dir (file-name-as-directory server-socket-dir))
            (server-name (format "anvil-deferred-%d" (emacs-pid)))
+           ;; emacsclient has no --socket-name without local sockets: it
+           ;; finds that server through EMACS_SERVER_FILE.
+           (tcp (or server-use-tcp (not (featurep 'make-network-process '(:family local)))))
+           (process-environment
+            (if tcp
+                (cons (concat "EMACS_SERVER_FILE=" (expand-file-name server-name server-auth-dir))
+                      process-environment)
+              process-environment))
            (script (expand-file-name "../anvil-stdio.sh"
                                      (file-name-directory (or load-file-name buffer-file-name
                                                               (locate-library "anvil-server-deferred-test")))))
@@ -201,9 +211,10 @@ Each response is a line; those read are removed from BUFFER."
             (setq process
                   (make-process :name "anvil-bridge" :buffer output :connection-type 'pipe
                                 :noquery t :stderr (get-buffer-create " *anvil-bridge-err*")
-                                :command (list "bash" script
-                                               (concat "--socket=" (expand-file-name server-name server-socket-dir))
-                                               (concat "--server-id=" anvil-server-deferred-test--server))))
+                                :command `("bash" ,script
+                                           ,@(unless tcp
+                                               (list (concat "--socket=" (expand-file-name server-name server-socket-dir))))
+                                           ,(concat "--server-id=" anvil-server-deferred-test--server))))
             (process-send-string process (concat (anvil-server-deferred-test--call 11 "later" "held") "\n"))
             (process-send-string process (concat (anvil-server-deferred-test--call 12 "now" "quick") "\n"))
             (let ((quick (anvil-server-deferred-test--read-response process output 12 (+ (float-time) 20))))
