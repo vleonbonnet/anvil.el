@@ -104,5 +104,52 @@ notifications/roots/list_changed once a session gains a directory."
     (should (equal (alist-get 'code (alist-get 'error response))
                    anvil-server-jsonrpc-error-method-not-found))))
 
+;;;; The listChanged capability
+
+(defun anvil-server-dispatch-guards-test--sentinel ()
+  "Return ok."
+  "ok")
+
+(defun anvil-server-dispatch-guards-test--capabilities (method relists)
+  "Return the capabilities METHOD reports, as parsed.
+METHOD is initialize or server/discover; RELISTS binds
+`anvil-server-transport-relists'."
+  (let ((anvil-server--running t)
+        (anvil-server-transport-relists relists))
+    (alist-get 'capabilities
+               (alist-get 'result
+                          (json-read-from-string
+                           (anvil-server-process-jsonrpc
+                            (format "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":%S%s}"
+                                    method
+                                    (if (equal method "server/discover")
+                                        ",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}"
+                                      ""))
+                            "guards-caps-test"))))))
+
+(ert-deftest anvil-server-dispatch-guards-test-list-changed-capability ()
+  "Over a transport that relists, initialize declares listChanged for the lists the server has.
+The stdio bridge announces a list changed when it drops an answer to
+tools/list or resources/list the client gave up on, and a client acts
+on that only when the server declared the capability.  server/discover
+never declares it: a 2026-07-28 client would open a
+subscriptions/listen stream, which the server does not serve."
+  (anvil-server-register-tool #'anvil-server-dispatch-guards-test--sentinel
+                              :id "guards-sentinel" :description "Sentinel"
+                              :server-id "guards-caps-test")
+  (anvil-server-register-resource "guards://resource" (lambda () "text")
+                                  :name "Guards resource" :server-id "guards-caps-test")
+  (unwind-protect
+      (dolist (method '("initialize" "server/discover"))
+        (dolist (relists '(t nil))
+          (let ((capabilities (anvil-server-dispatch-guards-test--capabilities method relists))
+                (declared (and relists (equal method "initialize") t)))
+            (should (assq 'tools capabilities))
+            (should (assq 'resources capabilities))
+            (should (eq (alist-get 'listChanged (alist-get 'tools capabilities)) declared))
+            (should (eq (alist-get 'listChanged (alist-get 'resources capabilities)) declared)))))
+    (anvil-server-unregister-tool "guards-sentinel" "guards-caps-test")
+    (anvil-server-unregister-resource "guards://resource" "guards-caps-test")))
+
 (provide 'anvil-server-dispatch-guards-test)
 ;;; anvil-server-dispatch-guards-test.el ends here

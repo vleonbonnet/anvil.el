@@ -1392,6 +1392,33 @@ Returns a JSON-RPC response string for the request."
 
 ;;; Notification handlers
 
+(defvar anvil-server-transport-relists nil
+  "Non-nil while the transport serving the request asks clients to list again.
+The stdio bridge binds it as it dispatches a request.  A client that
+gave up waiting for its answer to tools/list or resources/list, as
+Claude Code does after 30 s, would show none of the server's tools or
+resources: the bridge then drops the late answer and sends
+notifications/tools/list_changed or notifications/resources/list_changed
+instead.  A client acts on those only when the server declared the
+capability, so initialize declares `listChanged' for the lists the
+server has while this is non-nil.  server/discover does not: a client
+of the 2026-07-28 era that sees it opens a subscriptions/listen
+stream, which this server does not serve.  Other transports leave it
+nil.")
+
+(defun anvil-server--list-capability ()
+  "Return the object declaring a tools or resources capability, for `json-encode'.
+See `anvil-server-transport-relists'."
+  (let ((capability (make-hash-table :test #'equal)))
+    (when anvil-server-transport-relists
+      (puthash "listChanged" t capability))
+    capability))
+
+(defun anvil-server--list-capability-json ()
+  "Return the JSON object declaring a tools or resources capability.
+See `anvil-server-transport-relists'."
+  (if anvil-server-transport-relists "{\"listChanged\":true}" "{}"))
+
 (defun anvil-server--capabilities-json (server-id)
   "Return the capabilities object JSON advertised for SERVER-ID."
   (let* ((resolved-id (anvil-server--resolve-id server-id))
@@ -1443,12 +1470,12 @@ is resolved through `anvil-server-id-aliases' for capability lookup."
           (templates-table
            (gethash resolved-id anvil-server--resource-templates)))
       (when (and tools-table (> (hash-table-count tools-table) 0))
-        (push `(tools . ,(make-hash-table)) capabilities))
+        (push `(tools . ,(anvil-server--list-capability)) capabilities))
       (when (or (and resources-table
                      (> (hash-table-count resources-table) 0))
                 (and templates-table
                      (> (hash-table-count templates-table) 0)))
-        (push `(resources . ,(make-hash-table)) capabilities))
+        (push `(resources . ,(anvil-server--list-capability)) capabilities))
       (if (fboundp 'nelisp--write-stderr-line)
           ;; Standalone NeLisp can spend tens of seconds in `json-encode'
           ;; even for this tiny fixed response.  Build the result JSON
@@ -1460,9 +1487,11 @@ is resolved through `anvil-server-id-aliases' for capability lookup."
                           (delq nil
                                 (list
                                  (when (assoc 'tools capabilities)
-                                   "\"tools\":{}")
+                                   (concat "\"tools\":"
+                                           (anvil-server--list-capability-json)))
                                  (when (assoc 'resources capabilities)
-                                   "\"resources\":{}")))
+                                   (concat "\"resources\":"
+                                           (anvil-server--list-capability-json)))))
                           ",")
                          "}")))
             (anvil-server--jsonrpc-response-from-result-json

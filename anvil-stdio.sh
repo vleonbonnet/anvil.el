@@ -28,7 +28,7 @@ EMACS_MCP_DEBUG_LOG=${EMACS_MCP_DEBUG_LOG:-""}
 # GNU base64 tolerates stray non-alphabet bytes with --ignore-garbage;
 # BSD/macOS base64 has no such flag.  Probe once at startup and pass
 # the flag only where supported.
-if printf 'Zg==' | base64 -d --ignore-garbage >/dev/null 2>&1; then
+if base64 -d --ignore-garbage <<<'Zg==' >/dev/null 2>&1; then
 	_anvil_b64_flags="--ignore-garbage"
 else
 	_anvil_b64_flags=""
@@ -61,13 +61,66 @@ if [ -n "$EMACS_MCP_DEBUG_LOG" ]; then
 	_anvil_git_sha="$(git -C "$_anvil_script_dir" rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
 	_anvil_mtime="$(stat -c %Y "$_anvil_script_path" 2>/dev/null || stat -f %m "$_anvil_script_path" 2>/dev/null || echo 'unknown')"
 	mcp_debug_log "INFO" "anvil-stdio.sh path=$_anvil_script_path git=$_anvil_git_sha mtime=$_anvil_mtime"
-	mcp_debug_log "INFO" "tooling bash=$(command -v bash || echo '?') sed=$(command -v sed || echo '?') tr=$(command -v tr || echo '?') base64=$(command -v base64 || echo '?') emacsclient=$(command -v emacsclient || echo '?')"
+	mcp_debug_log "INFO" "tooling bash=$(command -v bash || echo '?') base64=$(command -v base64 || echo '?') timeout=$(command -v timeout || echo '?') emacsclient=$(command -v emacsclient || echo '?')"
+	_anvil_debug=1
 else
 	# No-op function when debug logging is disabled
 	mcp_debug_log() {
 		:
 	}
+	_anvil_debug=0
 fi
+
+# --- The bridge's files -----------------------------------------------
+# A request starts four programs: base64 to encode it, emacsclient
+# under its timeout supervisor, and base64 to decode the answer.  Each
+# command substitution or pipeline forks the shell, which costs as
+# much as starting a program on MS-Windows (MSYS2: tens of
+# milliseconds, a tenth of a second on a loaded machine), so the
+# bridge passes data through files it reuses, read back with `read',
+# rather than through $(...).  The files of the main loop start with
+# "$_anvil_main", those of a deferred answer's poller with its own
+# prefix; the exit removes them all, with the output lock and the
+# pollers' hold files.
+_anvil_state="${TMPDIR:-/tmp}"
+_anvil_state="${_anvil_state%/}/anvil-stdio-$$"
+_anvil_out_lock="$_anvil_state.lock"
+_anvil_main="$_anvil_state.main"
+
+anvil_cleanup() {
+	local hold pid job
+	for hold in "$_anvil_state".hold-*; do
+		if [ -f "$hold" ]; then
+			read -r pid job <"$hold" || true
+			kill "$pid" 2>/dev/null || true
+		fi
+	done
+	rm -f "$_anvil_state".*
+}
+trap anvil_cleanup EXIT
+# Signals end the bridge through its exit, so that its pollers stop.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# anvil_read_file FILE
+#
+# Sets `_anvil_file_text' to the contents of FILE.
+anvil_read_file() {
+	_anvil_file_text=""
+	IFS= read -r -d '' _anvil_file_text <"$1" || :
+}
+
+# anvil_read_output FILE
+#
+# Sets `_anvil_file_text' to the contents of FILE, without the newlines
+# ending it, as a command substitution would give them.
+anvil_read_output() {
+	anvil_read_file "$1"
+	while [[ $_anvil_file_text == *$'\n' ]]; do
+		_anvil_file_text=${_anvil_file_text%$'\n'}
+	done
+}
 
 # --- Retry wrapper for emacsclient ------------------------------------
 # Absorbs the ~few-second window where `emacs --daemon' is being
@@ -166,21 +219,20 @@ grace_then_kill();
 exit 124;
 PERL
 
-# anvil_emacsclient_retry STDERR_FILE -- EMACSCLIENT_ARGS...
+# anvil_emacsclient_retry FILES -- EMACSCLIENT_ARGS...
 #
 # Run `emacsclient EMACSCLIENT_ARGS...', retrying on transient socket-
-# missing / connection-refused errors.  STDERR_FILE receives stderr of
-# the final attempt.  Non-socket failures (e.g. elisp errors) surface
+# missing / connection-refused errors.  Sets `_anvil_out' to the
+# stdout of the final attempt, without its final newlines, and
+# `_anvil_rc' to its status; FILES.out and FILES.err receive its
+# stdout and stderr.  Non-socket failures (e.g. elisp errors) surface
 # immediately so genuine faults aren't masked.
-# Prints emacsclient's stdout on success; exits with emacsclient's rc.
 anvil_emacsclient_retry() {
-	local stderr_file="$1"
+	local files="$1" attempt=0 err delay_sec
 	shift
 	if [ "${1-}" = "--" ]; then shift; fi
 
-	local attempt=0 out="" rc=0
 	while :; do
-		set +e
 		# VAL-PATCH-TIMEOUT-V2: hard wall-clock cap on emacsclient.
 		# Default 330s (daemon's `with-timeout' is 300s — we sit
 		# slightly above so the daemon can return a richer error
@@ -189,48 +241,48 @@ anvil_emacsclient_retry() {
 		# process-group supervisor embedded in this script.
 		_anvil_tmo="${ANVIL_EMACSCLIENT_TIMEOUT:-330}"
 		if [ "$_anvil_tmo" = "0" ]; then
-			out=$(emacsclient "$@" 2>"$stderr_file")
-			rc=$?
+			emacsclient "$@" >"$files.out" 2>"$files.err" && _anvil_rc=0 || _anvil_rc=$?
 		elif command -v timeout >/dev/null 2>&1; then
 			# GNU timeout otherwise waits forever for a TERM-resistant
 			# emacsclient to exit.  Escalate its command group to KILL
 			# after one second while timeout is monitoring it.
-			out=$(timeout -k 1 "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
-			rc=$?
+			timeout -k 1 "$_anvil_tmo" emacsclient "$@" >"$files.out" 2>"$files.err" \
+				&& _anvil_rc=0 || _anvil_rc=$?
 		elif command -v perl >/dev/null 2>&1; then
-			out=$(perl -e "$_anvil_perl_timeout_program" "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
-			rc=$?
+			perl -e "$_anvil_perl_timeout_program" "$_anvil_tmo" emacsclient "$@" \
+				>"$files.out" 2>"$files.err" && _anvil_rc=0 || _anvil_rc=$?
 		else
-			printf '%s\n' "Anvil: no usable timeout backend (GNU timeout or Perl supervisor)" >"$stderr_file"
-			out=""
-			rc=69
+			printf '%s\n' "Anvil: no usable timeout backend (GNU timeout or Perl supervisor)" >"$files.err"
+			: >"$files.out"
+			_anvil_rc=69
 		fi
-		set -e
-		if [ "$rc" -eq 0 ]; then
-			printf '%s' "$out"
+		anvil_read_output "$files.out"
+		_anvil_out="$_anvil_file_text"
+		if [ "$_anvil_rc" -eq 0 ]; then
 			return 0
 		fi
-		if [ -s "$stderr_file" ] \
-			&& grep -qE "$_anvil_retry_pattern" "$stderr_file"; then
+		anvil_read_file "$files.err"
+		err="$_anvil_file_text"
+		if [ -n "$err" ] && [[ $err =~ $_anvil_retry_pattern ]]; then
 			attempt=$((attempt + 1))
 			if [ "$attempt" -ge "$ANVIL_EMACSCLIENT_RETRY_MAX" ]; then
-				mcp_debug_log "RETRY-EXHAUSTED" "attempts=$attempt max=$ANVIL_EMACSCLIENT_RETRY_MAX rc=$rc"
-				printf '%s' "$out"
-				return "$rc"
+				mcp_debug_log "RETRY-EXHAUSTED" "attempts=$attempt max=$ANVIL_EMACSCLIENT_RETRY_MAX rc=$_anvil_rc"
+				return 0
 			fi
 			if [ "$attempt" -eq 1 ] || [ $((attempt % 10)) -eq 0 ]; then
-				mcp_debug_log "RETRY" "attempt=$attempt rc=$rc stderr=$(tr '\n' ' ' <"$stderr_file" | cut -c1-120)"
+				err="${err//$'\n'/ }"
+				mcp_debug_log "RETRY" "attempt=$attempt rc=$_anvil_rc stderr=${err:0:120}"
 			fi
 			if [ "$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" -gt 0 ]; then
-				local delay_sec
-				delay_sec=$(awk -v ms="$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" 'BEGIN{printf "%.3f", ms/1000}')
+				printf -v delay_sec '%d.%03d' \
+					$((ANVIL_EMACSCLIENT_RETRY_DELAY_MS / 1000)) \
+					$((ANVIL_EMACSCLIENT_RETRY_DELAY_MS % 1000))
 				sleep "$delay_sec"
 			fi
 			continue
 		fi
 		# Non-retriable failure — surface immediately.
-		printf '%s' "$out"
-		return "$rc"
+		return 0
 	done
 }
 
@@ -298,22 +350,19 @@ if [ -n "$INIT_FUNCTION" ]; then
 	mcp_debug_log "INIT-CALL" "emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e ($INIT_FUNCTION) (with retry)"
 
 	# Execute the command and capture output and return code
-	init_stderr_file="/tmp/mcp-init-stderr.$$-$(date +%s%N)"
-	mcp_debug_log "INIT-STDERR-FILE" "$init_stderr_file"
-	set +e
-	INIT_OUTPUT=$(anvil_emacsclient_retry "$init_stderr_file" -- \
+	anvil_emacsclient_retry "$_anvil_state.init" -- \
 		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-		-e "($INIT_FUNCTION)")
-	INIT_RC=$?
-	set -e
+		-e "($INIT_FUNCTION)"
+	INIT_RC=$_anvil_rc
+	INIT_OUTPUT=$_anvil_out
 
 	# Log results
 	mcp_debug_log "INIT-RC" "$INIT_RC"
 	mcp_debug_log "INIT-OUTPUT" "$INIT_OUTPUT"
-	if [ -s "$init_stderr_file" ]; then
-		mcp_debug_log "INIT-STDERR" "$(cat "$init_stderr_file")"
+	if [ "$_anvil_debug" = 1 ] && [ -s "$_anvil_state.init.err" ]; then
+		anvil_read_file "$_anvil_state.init.err"
+		mcp_debug_log "INIT-STDERR" "$_anvil_file_text"
 	fi
-	rm -f "$init_stderr_file"
 else
 	mcp_debug_log "INFO" "Skipping init function call (none provided)"
 fi
@@ -382,21 +431,29 @@ anvil_mcp_read_framed_message() {
 # Emits BODY framed with Content-Length.  N is computed in bytes
 # (not characters) because the MCP spec mandates byte length.
 anvil_mcp_emit_framed_response() {
-	local body="$1"
-	local n
-	# `wc -c' counts bytes (LANG=C ensures no locale weirdness).
-	n=$(LC_ALL=C printf '%s' "$body" | wc -c)
-	# Strip leading whitespace from wc output (BSD pads).
-	n="${n##* }"
-	printf 'Content-Length: %s\r\n\r\n%s' "$n" "$body"
+	anvil_byte_length "$1"
+	printf 'Content-Length: %s\r\n\r\n%s' "$_anvil_length" "$1"
 }
 
-# anvil_decode_reply RAW
+# anvil_byte_length TEXT
+#
+# Sets `_anvil_length' to the length of TEXT in bytes: in the C locale,
+# the shell counts bytes rather than characters.
+anvil_byte_length() {
+	local LC_ALL=C
+	_anvil_length=${#1}
+}
+
+# anvil_decode_reply RAW FILES
 #
 # Sets _anvil_reply to the text RAW, emacsclient's printed base64
-# string, encodes.
+# string, encodes.  FILES is the prefix of the files to use.
 anvil_decode_reply() {
-	local raw="$1" decoded rc err_file
+	local raw="$1" files="$2" stripped rc
+	# Drop the end of emacsclient's line, CR LF on MS-Windows.
+	while [[ $raw == *[$'\r\n'] ]]; do
+		raw=${raw%?}
+	done
 	# Strip the quotes emacsclient prints around a string.
 	if [[ "$raw" == \"* && "$raw" == *\" ]]; then
 		raw="${raw:1:${#raw}-2}"
@@ -412,75 +469,90 @@ anvil_decode_reply() {
 	# loses its `-print-nonl ' prefix and emacsclient prints it as
 	#   *ERROR*: Unknown message: <tail>
 	# interleaved with the legitimate base64 payload.  Strip those
-	# injection markers with `sed s///g' (POSIX BRE, so `\*' is
-	# unambiguously a literal asterisk on every sed implementation --
-	# unlike `awk' where `\*' in ERE is treated differently by gawk /
-	# mawk / busybox / git-bash-bundled awk and may cause the strip to
-	# silently fail).  Then remove ALL CR/LF bytes; frame boundaries
-	# leave CRLF behind, and `tr' is trivially portable.  `--ignore-
-	# garbage' on the base64 decoder is NOT sufficient on its own: the
+	# injection markers, then remove ALL CR/LF bytes; frame boundaries
+	# leave CRLF behind.  The shell's own pattern substitution does both,
+	# with no sed or tr to start.  `--ignore-garbage' on the base64
+	# decoder is NOT sufficient on its own: the
 	# marker text "ERROR Unknown message" is 15 base64-alphabet bytes
 	# that the decoder happily consumes as payload, throwing off the
 	# multiple-of-4 requirement and yielding `invalid input' under
 	# `set -e -o pipefail'.  Stripping the marker textually, before
 	# decoding, is what makes Windows work at all.
 	# (No-op on Linux/macOS where one frame fits in one read.)
-	raw=$(printf '%s' "$raw" \
-		| sed 's/\*ERROR\*: Unknown message: //g' \
-		| tr -d '\r\n')
+	raw=${raw//'*ERROR*: Unknown message: '/}
+	raw=${raw//[$'\r\n']/}
 
 	# Diagnostic: confirm strip actually happened.  If markers survived,
 	# base64 -d will almost certainly fail below, and we want the log to
 	# say so out loud rather than just ending at BASE64-RESPONSE.
-	mcp_debug_log "INFO" "after-strip len=${#raw} markers=$(printf '%s' "$raw" | grep -c '\*ERROR\*' || true)"
+	if [ "$_anvil_debug" = 1 ]; then
+		stripped=${raw//'*ERROR*'/}
+		mcp_debug_log "INFO" "after-strip len=${#raw} markers=$(((${#raw} - ${#stripped}) / 7))"
+	fi
 
 	# Decode the base64 content (lenient against stray non-base64 bytes).
 	# Capture rc/stderr explicitly so that a decode failure is logged
 	# instead of silently killing the script under `set -e -o pipefail'.
-	err_file="$_anvil_state.decode-err.$$-$RANDOM"
-	set +e
-	decoded=$(printf '%s' "$raw" | base64 -d $_anvil_b64_flags 2>"$err_file")
-	rc=$?
-	set -e
-	if [ "$rc" != 0 ]; then
-		mcp_debug_log "DECODE-ERROR" "rc=$rc stderr=$(tr '\n' ' ' <"$err_file" 2>/dev/null) input_head=${raw:0:160}"
+	printf '%s' "$raw" >"$files.b64"
+	base64 -d $_anvil_b64_flags <"$files.b64" >"$files.dec" 2>"$files.err" && rc=0 || rc=$?
+	if [ "$rc" != 0 ] && [ "$_anvil_debug" = 1 ]; then
+		anvil_read_file "$files.err"
+		mcp_debug_log "DECODE-ERROR" "rc=$rc stderr=${_anvil_file_text//$'\n'/ } input_head=${raw:0:160}"
 	fi
-	rm -f "$err_file"
-	_anvil_reply="$decoded"
+	anvil_read_output "$files.dec"
+	_anvil_reply="$_anvil_file_text"
 }
 
-# anvil_call_emacs EXPR
+# anvil_call_emacs EXPR [FILES]
 #
 # Evaluates EXPR, which returns a string encoded in base64, in Emacs,
 # and sets _anvil_reply to that string decoded, and _anvil_client_rc to
-# emacsclient's status.
+# emacsclient's status.  FILES, the prefix of the files to use, is the
+# main loop's by default.
 anvil_call_emacs() {
-	local stderr_file="$_anvil_state.stderr.$$-$RANDOM" raw
-	set +e
-	raw=$(anvil_emacsclient_retry "$stderr_file" -- \
+	local files="${2:-$_anvil_main}"
+	anvil_emacsclient_retry "$files" -- \
 		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-		-e "$1")
-	_anvil_client_rc=$?
-	set -e
+		-e "$1"
+	_anvil_client_rc=$_anvil_rc
 	mcp_debug_log "EMACSCLIENT-RC" "$_anvil_client_rc"
-	if [ -s "$stderr_file" ]; then
-		mcp_debug_log "EMACSCLIENT-STDERR" "$(<"$stderr_file")"
+	if [ "$_anvil_debug" = 1 ] && [ -s "$files.err" ]; then
+		anvil_read_file "$files.err"
+		mcp_debug_log "EMACSCLIENT-STDERR" "$_anvil_file_text"
 	fi
-	rm -f "$stderr_file"
-	mcp_debug_log "BASE64-RESPONSE" "$raw"
-	anvil_decode_reply "$raw"
+	mcp_debug_log "BASE64-RESPONSE" "$_anvil_out"
+	anvil_decode_reply "$_anvil_out" "$files"
+}
+
+# anvil_pollers_exist
+#
+# Succeeds while a deferred answer's poller may write: from before the
+# main loop starts it until it wrote its last.
+anvil_pollers_exist() {
+	local hold
+	for hold in "$_anvil_state".hold-*; do
+		if [ -e "$hold" ]; then
+			return 0
+		fi
+	done
+	return 1
 }
 
 # anvil_emit BODY FRAMED
 #
 # Writes BODY to the client, framed when FRAMED is 1, alone on standard
 # output: deferred answers come from other processes, and a lock keeps
-# their responses whole.
+# their responses whole.  The main loop takes it only while a poller
+# exists (taking it forks, and releasing it starts rm).
 anvil_emit() {
-	# noclobber creates the lock exclusively, as a builtin.
-	until (set -C && : >"$_anvil_out_lock") 2>/dev/null; do
-		sleep 0.01
-	done
+	local locked=0
+	if anvil_pollers_exist; then
+		# noclobber creates the lock exclusively, as a builtin.
+		until (set -C && : >"$_anvil_out_lock") 2>/dev/null; do
+			sleep 0.01
+		done
+		locked=1
+	fi
 	if [ "$2" = "1" ]; then
 		# T71: framed output for MCP-compliant clients.
 		anvil_mcp_emit_framed_response "$1"
@@ -488,23 +560,181 @@ anvil_emit() {
 		# Legacy line-delimited output (dev / test mode).
 		printf '%s\n' "$1"
 	fi
-	rm -f "$_anvil_out_lock"
+	if [ "$locked" = 1 ]; then
+		rm -f "$_anvil_out_lock"
+	fi
 }
 
 # anvil_request_id REQUEST
 #
-# Prints the JSON id of REQUEST, as written there, or nothing.
+# Sets `_anvil_id' to the JSON id of REQUEST, as written there, or to
+# nothing.  Where "id" appears more than once, the last one is taken.
+_anvil_request_id_re='^.*"id"[[:space:]]*:[[:space:]]*(-?[0-9]+|"[^"]*"|null)'
 anvil_request_id() {
-	printf '%s' "$1" \
-		| sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*"|null).*/\1/p' \
-		| head -1
+	_anvil_id=""
+	if [[ $1 =~ $_anvil_request_id_re ]]; then
+		_anvil_id="${BASH_REMATCH[1]}"
+	fi
 }
 
 # anvil_emit_error ID MESSAGE FRAMED
 #
 # Answers the request ID with a JSON-RPC internal error saying MESSAGE.
 anvil_emit_error() {
-	anvil_emit "$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}' "$1" "$2")" "$3"
+	local body
+	printf -v body '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}' "$1" "$2"
+	anvil_emit "$body" "$3"
+}
+
+# --- Cancelled requests -------------------------------------------------
+# The bridge answers one request at a time.  A client that gave up
+# waiting for an answer, as Claude Code does after 30 s while Emacs is
+# busy, sends notifications/cancelled, and Claude Code takes a response
+# to a request it no longer knows for a broken connection: it drops the
+# server, and does not reconnect.  So before answering, the bridge reads
+# the messages already waiting, queueing them, and drops an answer the
+# client cancelled.  A list it gave up on is announced changed instead,
+# so that it lists again: having no answer to tools/list, Claude Code
+# would show none of the server's tools.  Emacs declares the
+# `listChanged' capability that makes a client heed that in its answer
+# to initialize, as the bridge binds `anvil-server-transport-relists';
+# a client connecting through server/discover (the 2026-07-28 era) is
+# not told, and only keeps its connection.  `read -t 0' only says whether
+# input is waiting; it needs bash 4, and older shells send every answer.
+# An answer that comes within moments of the cancellation can still be
+# sent before it arrives: nothing on this side can tell.
+
+_anvil_queue=()
+_anvil_queue_framed=()
+_anvil_eof=0
+# The ids of cancelled requests not answered yet, each on a line.
+_anvil_cancelled=$'\n'
+_anvil_can_drain=0
+if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+	_anvil_can_drain=1
+fi
+_anvil_cancel_id_re='"requestId"[[:space:]]*:[[:space:]]*(-?[0-9]+|"[^"]*")'
+# Every response Emacs makes begins so, giving the id of its request.
+_anvil_response_id_re='^[{]"jsonrpc":"2\.0","id":(-?[0-9]+|"([^"\\]|\\.)*")'
+_anvil_tools_list_re='"method"[[:space:]]*:[[:space:]]*"tools/list"'
+_anvil_resources_list_re='"method"[[:space:]]*:[[:space:]]*"resources/(templates/)?list"'
+
+# anvil_read_stdin_message
+#
+# Reads the next message from standard input into `_anvil_msg', setting
+# `_anvil_msg_framed' to 1 when it came in a Content-Length frame, and
+# `_anvil_msg_skip' to 1 when the frame could not be read.  Returns 1 at
+# the end of the input.
+anvil_read_stdin_message() {
+	local line first
+	_anvil_msg_skip=0
+	_anvil_msg_framed=0
+	IFS= read -r line || return 1
+	# T71: detect framing.  An MCP framed request begins with
+	# `Content-Length:' (case-insensitive); legacy line-delimited
+	# requests begin with `{'.
+	# Strip CR for cross-platform safety.
+	first="${line%$'\r'}"
+	if [[ "$first" =~ ^[Cc]ontent-[Ll]ength: ]]; then
+		_anvil_msg_framed=1
+		mcp_debug_log "FRAMING" "Content-Length detected"
+		# Re-read full framed message; reuse the already-consumed line.
+		line=$(anvil_mcp_read_framed_message "$first") || {
+			mcp_debug_log "FRAMING-ERROR" "rc=$? first=$first"
+			_anvil_msg_skip=1
+		}
+	fi
+	_anvil_msg="$line"
+}
+
+# anvil_read_message
+#
+# Reads the next message, queued or from standard input, as
+# `anvil_read_stdin_message' does.  Returns 1 at the end of the input.
+anvil_read_message() {
+	if [ "${#_anvil_queue[@]}" -gt 0 ]; then
+		_anvil_msg="${_anvil_queue[0]}"
+		_anvil_msg_framed="${_anvil_queue_framed[0]}"
+		_anvil_msg_skip=0
+		_anvil_queue=("${_anvil_queue[@]:1}")
+		_anvil_queue_framed=("${_anvil_queue_framed[@]:1}")
+		return 0
+	fi
+	if [ "$_anvil_eof" = 0 ] && anvil_read_stdin_message; then
+		return 0
+	fi
+	_anvil_eof=1
+	return 1
+}
+
+# anvil_drain_input
+#
+# Queues the messages waiting on standard input, noting the requests
+# they cancel.
+anvil_drain_input() {
+	if [ "$_anvil_can_drain" != 1 ]; then
+		return 0
+	fi
+	while [ "$_anvil_eof" = 0 ] && read -t 0; do
+		if ! anvil_read_stdin_message; then
+			_anvil_eof=1
+		elif [ "$_anvil_msg_skip" != 1 ]; then
+			anvil_note_cancel "$_anvil_msg"
+			_anvil_queue+=("$_anvil_msg")
+			_anvil_queue_framed+=("$_anvil_msg_framed")
+		fi
+	done
+}
+
+# anvil_note_cancel MESSAGE
+#
+# Notes the request MESSAGE cancels, if it is notifications/cancelled.
+anvil_note_cancel() {
+	case "$1" in
+	*'"notifications/cancelled"'*) ;;
+	*) return 0 ;;
+	esac
+	if [[ $1 =~ $_anvil_cancel_id_re ]]; then
+		_anvil_cancelled+="${BASH_REMATCH[1]}"$'\n'
+	fi
+}
+
+# anvil_forget_cancel ID
+#
+# Forgets that request ID was cancelled.
+anvil_forget_cancel() {
+	_anvil_cancelled=${_anvil_cancelled//$'\n'"$1"$'\n'/$'\n'}
+}
+
+# anvil_answer RESPONSE FRAMED REQUEST
+#
+# Sends RESPONSE, the answer to REQUEST, unless the client cancelled
+# REQUEST meanwhile: then it announces the list changed when REQUEST
+# asked for one, and sends nothing else.
+anvil_answer() {
+	local id="" head
+	anvil_drain_input
+	if [ "$_anvil_cancelled" != $'\n' ]; then
+		# Only its start is searched: a response can be megabytes long.
+		head="${1:0:200}"
+		if [[ $head =~ $_anvil_response_id_re ]]; then
+			id="${BASH_REMATCH[1]}"
+		else
+			anvil_request_id "$3"
+			id="$_anvil_id"
+		fi
+		if [ -n "$id" ] && [[ $_anvil_cancelled == *$'\n'"$id"$'\n'* ]]; then
+			anvil_forget_cancel "$id"
+			mcp_debug_log "CANCELLED" "id=$id: answer dropped"
+			if [[ $3 =~ $_anvil_tools_list_re ]]; then
+				anvil_emit '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' "$2"
+			elif [[ $3 =~ $_anvil_resources_list_re ]]; then
+				anvil_emit '{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}' "$2"
+			fi
+			return 0
+		fi
+	fi
+	anvil_emit "$1" "$2"
 }
 
 # --- Deferred answers ---------------------------------------------------
@@ -516,41 +746,23 @@ anvil_emit_error() {
 # neither do the other requests.  The poller gives up SECONDS plus a
 # minute after it began, answering an error; a request the client
 # cancels has its poller stopped.
-
-# The bridge's files: its output lock, and a file per poller, named by
-# the request it holds, giving its process and job.
-_anvil_state="${TMPDIR:-/tmp}"
-_anvil_state="${_anvil_state%/}/anvil-stdio-$$"
-_anvil_out_lock="$_anvil_state.lock"
-
-anvil_cleanup() {
-	local hold pid job
-	for hold in "$_anvil_state".hold-*; do
-		if [ -f "$hold" ]; then
-			read -r pid job <"$hold" || true
-			kill "$pid" 2>/dev/null || true
-			rm -f "$hold"
-		fi
-	done
-	rm -f "$_anvil_out_lock"
-}
-trap anvil_cleanup EXIT
-# Signals end the bridge through its exit, so that its pollers stop.
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+#
+# The bridge's files include one per poller, named by the request it
+# holds, giving its process and job.
 
 # anvil_hold_name ID
 #
-# Prints the name of the file holding the poller of the request ID.
+# Sets `_anvil_hold' to the name of the file holding the poller of the
+# request ID.
 anvil_hold_name() {
-	printf '%s.hold-%s' "$_anvil_state" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+	_anvil_hold="$_anvil_state.hold-${1//[^A-Za-z0-9._-]/_}"
 }
 
 # anvil_hold_deferred JOB SECONDS ID FRAMED
 anvil_hold_deferred() {
 	local job="$1" id="$3" framed="$4" reply delay=0.2 failures=0
 	local deadline=$((SECONDS + $2 + 60))
+	local files="$_anvil_state.poll-${id//[^A-Za-z0-9._-]/_}"
 	while :; do
 		sleep "$delay"
 		# A bridge gone, its client is too.
@@ -559,7 +771,7 @@ anvil_hold_deferred() {
 		0.2) delay=0.5 ;;
 		0.5) delay=1 ;;
 		esac
-		anvil_call_emacs "(base64-encode-string (encode-coding-string (or (anvil-server-deferred-poll \"$job\") \"\") 'utf-8 t) t)"
+		anvil_call_emacs "(base64-encode-string (encode-coding-string (or (anvil-server-deferred-poll \"$job\") \"\") 'utf-8 t) t)" "$files"
 		reply="$_anvil_reply"
 		case "$reply" in
 		-)
@@ -583,24 +795,27 @@ anvil_hold_deferred() {
 			;;
 		esac
 		if [ "$SECONDS" -gt "$deadline" ]; then
-			anvil_call_emacs "(base64-encode-string (anvil-server-deferred-cancel \"$job\") t)" || true
+			anvil_call_emacs "(base64-encode-string (anvil-server-deferred-cancel \"$job\") t)" "$files" || true
 			anvil_emit_error "$id" "Timed out waiting for a deferred answer" "$framed"
 			break
 		fi
 	done
-	rm -f "$(anvil_hold_name "$id")"
+	anvil_hold_name "$id"
+	rm -f "$_anvil_hold"
 }
 
 # anvil_cancel_held REQUEST
 #
-# Stops the poller of the request a notifications/cancelled REQUEST names.
+# Stops the poller of the request a notifications/cancelled REQUEST
+# names, and forgets the cancellation: the request was answered, or
+# its answer dropped, before the main loop reads its cancellation.
 anvil_cancel_held() {
 	local id hold pid job
-	id=$(printf '%s' "$1" \
-		| sed -nE 's/.*"requestId"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*").*/\1/p' \
-		| head -1)
-	[ -n "$id" ] || return 0
-	hold=$(anvil_hold_name "$id")
+	[[ $1 =~ $_anvil_cancel_id_re ]] || return 0
+	id="${BASH_REMATCH[1]}"
+	anvil_forget_cancel "$id"
+	anvil_hold_name "$id"
+	hold="$_anvil_hold"
 	if [ -f "$hold" ]; then
 		read -r pid job <"$hold" || true
 		mcp_debug_log "DEFERRED-CANCEL" "id=$id job=$job"
@@ -611,22 +826,12 @@ anvil_cancel_held() {
 }
 
 # Process input and print response
-while IFS= read -r line; do
-	# T71: detect framing.  An MCP framed request begins with
-	# `Content-Length:' (case-insensitive); legacy line-delimited
-	# requests begin with `{'.
-	# Strip CR for cross-platform safety.
-	_anvil_first_line="${line%$'\r'}"
-	_anvil_framed=0
-	if [[ "$_anvil_first_line" =~ ^[Cc]ontent-[Ll]ength: ]]; then
-		_anvil_framed=1
-		mcp_debug_log "FRAMING" "Content-Length detected"
-		# Re-read full framed message; reuse the already-consumed line.
-		line=$(anvil_mcp_read_framed_message "$_anvil_first_line") || {
-			mcp_debug_log "FRAMING-ERROR" "rc=$? first=$_anvil_first_line"
-			continue
-		}
+while anvil_read_message; do
+	if [ "$_anvil_msg_skip" = 1 ]; then
+		continue
 	fi
+	line="$_anvil_msg"
+	_anvil_framed="$_anvil_msg_framed"
 
 	# Log the incoming request
 	mcp_debug_log "REQUEST" "$line"
@@ -638,14 +843,18 @@ while IFS= read -r line; do
 	# Base64 encode the raw JSON to avoid emacsclient transport issues
 	# with a specific combination of length, UTF-8 characters, and quoting
 	# that occurs in Test 5 with the Lithuanian letter 'ą'
-	base64_input=$(echo -n "$line" | base64)
+	printf '%s' "$line" >"$_anvil_main.req"
+	base64 <"$_anvil_main.req" >"$_anvil_main.enc"
+	anvil_read_output "$_anvil_main.enc"
+	base64_input="$_anvil_file_text"
 	mcp_debug_log "BASE64-INPUT" "$base64_input"
 
 	# Process JSON-RPC request and return the result with proper UTF-8 encoding
 	# Encode the response to base64 to avoid any character encoding issues
 	# Handle nil responses from notifications by converting to empty string.
-	# `anvil-server-deferrable' tells tools this bridge holds deferred answers.
-	elisp_expr="(base64-encode-string (encode-coding-string (or (let ((anvil-server-deferrable t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\") 'utf-8 t) t)"
+	# `anvil-server-deferrable' tells tools this bridge holds deferred answers,
+	# `anvil-server-transport-relists' that it announces lists changed.
+	elisp_expr="(base64-encode-string (encode-coding-string (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\") 'utf-8 t) t)"
 
 	# Get response from emacsclient (with retry across daemon restarts).
 	# The rc is for logging only; an empty response is a soft failure.
@@ -660,14 +869,19 @@ while IFS= read -r line; do
 		_anvil_job="${_anvil_deferred%%:*}"
 		_anvil_seconds="${_anvil_deferred##*:}"
 		[[ "$_anvil_seconds" =~ ^[0-9]+$ ]] || _anvil_seconds=600
-		_anvil_id_field=$(anvil_request_id "$line")
+		anvil_request_id "$line"
+		_anvil_id_field="${_anvil_id:-null}"
 		mcp_debug_log "DEFERRED" "id=$_anvil_id_field job=$_anvil_job seconds=$_anvil_seconds"
-		anvil_hold_deferred "$_anvil_job" "$_anvil_seconds" "${_anvil_id_field:-null}" "$_anvil_framed" &
-		echo "$! $_anvil_job" >"$(anvil_hold_name "${_anvil_id_field:-null}")"
+		# The hold file is there before the poller runs: `anvil_emit'
+		# takes the output lock only while one is.
+		anvil_hold_name "$_anvil_id_field"
+		: >"$_anvil_hold"
+		anvil_hold_deferred "$_anvil_job" "$_anvil_seconds" "$_anvil_id_field" "$_anvil_framed" &
+		echo "$! $_anvil_job" >"$_anvil_hold"
 		;;
 	?*)
 		# Only output non-empty responses
-		anvil_emit "$formatted_response" "$_anvil_framed"
+		anvil_answer "$formatted_response" "$_anvil_framed" "$line"
 		;;
 	*)
 		# VAL-PATCH-ALWAYS-REPLY: empty daemon output for a
@@ -675,10 +889,14 @@ while IFS= read -r line; do
 		# forever.  Synthesise a JSON-RPC error so the client
 		# can match the id and move on.  Notifications (no id)
 		# stay silent as the protocol expects.
-		_anvil_id_field=$(anvil_request_id "$line")
+		anvil_request_id "$line"
+		_anvil_id_field="$_anvil_id"
 		if [ -n "$_anvil_id_field" ] && [ "$_anvil_id_field" != "null" ]; then
 			mcp_debug_log "SYNTH-ERROR" "id=$_anvil_id_field rc=${_anvil_client_rc:-?}"
-			anvil_emit_error "$_anvil_id_field" "Bridge synthetic error: daemon returned empty response (emacsclient rc=${_anvil_client_rc:-?})" "$_anvil_framed"
+			printf -v _anvil_error '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}' \
+				"$_anvil_id_field" \
+				"Bridge synthetic error: daemon returned empty response (emacsclient rc=${_anvil_client_rc:-?})"
+			anvil_answer "$_anvil_error" "$_anvil_framed" "$line"
 		fi
 		;;
 	esac
@@ -690,21 +908,19 @@ if [ -n "$STOP_FUNCTION" ]; then
 	mcp_debug_log "STOP-CALL" "emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e ($STOP_FUNCTION) (with retry)"
 
 	# Execute the command and capture output and return code
-	stop_stderr_file="/tmp/mcp-stop-stderr.$$-$(date +%s%N)"
-	set +e
-	STOP_OUTPUT=$(anvil_emacsclient_retry "$stop_stderr_file" -- \
+	anvil_emacsclient_retry "$_anvil_state.stop" -- \
 		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-		-e "($STOP_FUNCTION)")
-	STOP_RC=$?
-	set -e
+		-e "($STOP_FUNCTION)"
+	STOP_RC=$_anvil_rc
+	STOP_OUTPUT=$_anvil_out
 
 	# Log results
 	mcp_debug_log "STOP-RC" "$STOP_RC"
 	mcp_debug_log "STOP-OUTPUT" "$STOP_OUTPUT"
-	if [ -s "$stop_stderr_file" ]; then
-		mcp_debug_log "STOP-STDERR" "$(cat "$stop_stderr_file")"
+	if [ "$_anvil_debug" = 1 ] && [ -s "$_anvil_state.stop.err" ]; then
+		anvil_read_file "$_anvil_state.stop.err"
+		mcp_debug_log "STOP-STDERR" "$_anvil_file_text"
 	fi
-	rm -f "$stop_stderr_file"
 else
 	mcp_debug_log "INFO" "Skipping stop function call (none provided)"
 fi
