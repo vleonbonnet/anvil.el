@@ -79,5 +79,30 @@
         (should (assq 'result resp))
         (should-not (assq 'error resp))))))
 
+;;;; Notifications
+
+(ert-deftest anvil-server-dispatch-guards-test-notifications-unanswered ()
+  "A message without an id gets no answer, whatever its method.
+JSON-RPC forbids answering a notification, and Claude Code drops a
+connection that sends a message with a null id: it sends
+notifications/roots/list_changed once a session gains a directory."
+  (let ((anvil-server--running t))
+    (dolist (method '("notifications/roots/list_changed" "notifications/initialized"
+                      "notifications/cancelled" "notifications/unknown" "unknown/method"))
+      (should-not (anvil-server-process-jsonrpc
+                   (json-encode `((jsonrpc . "2.0") (method . ,method)))
+                   "guards-test")))))
+
+(ert-deftest anvil-server-dispatch-guards-test-unknown-method-answered ()
+  "A request for an unknown method still gets method-not-found, with its id."
+  (let* ((anvil-server--running t)
+         (response (json-read-from-string
+                    (anvil-server-process-jsonrpc
+                     "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"unknown/method\"}"
+                     "guards-test"))))
+    (should (equal (alist-get 'id response) 9))
+    (should (equal (alist-get 'code (alist-get 'error response))
+                   anvil-server-jsonrpc-error-method-not-found))))
+
 (provide 'anvil-server-dispatch-guards-test)
 ;;; anvil-server-dispatch-guards-test.el ends here

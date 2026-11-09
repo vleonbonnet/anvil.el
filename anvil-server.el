@@ -1066,7 +1066,8 @@ SERVER-ID is required and identifies which server registry to use.
 
 The function performs JSON-RPC 2.0 validation, checking:
 - Protocol version (must be \"2.0\")
-- ID field presence (required for regular requests, forbidden for notifications)
+- ID field presence (forbidden for notifications/* methods; a message
+  without one is a notification, never answered)
 - Method field presence (always required)
 
 If validation succeeds, dispatches the request to the appropriate handler.
@@ -1102,12 +1103,11 @@ Returns a JSON-RPC formatted response string, or nil for notifications."
        nil
        anvil-server-jsonrpc-error-invalid-request
        "Invalid Request: Notifications must not include 'id' field"))
-     ;; Check if id is missing
+     ;; A message without an id is a notification, whatever its method,
+     ;; and JSON-RPC forbids answering one: Claude Code drops a
+     ;; connection that sends it a message with a null id.
      ((and (not id) (not is-notification))
-      (anvil-server--jsonrpc-error
-       nil
-       anvil-server-jsonrpc-error-invalid-request
-       "Invalid Request: Missing required 'id' field"))
+      nil)
      ;; Check if method is missing
      ((not method)
       (anvil-server--jsonrpc-error
@@ -1379,6 +1379,11 @@ Returns a JSON-RPC response string for the request."
       (catch 'anvil-server--deferred
         (anvil-server--handle-tools-call
          id params method-metrics server-id)))
+     ;; Other notifications, such as the notifications/roots/list_changed
+     ;; Claude Code sends when a session gains a directory, need nothing,
+     ;; and an answer, its id null, would break the connection.
+     ((string-prefix-p "notifications/" method)
+      nil)
      (t
       (anvil-server--jsonrpc-error
        id
