@@ -223,6 +223,90 @@
        (should (eq t (alist-get 'success response)))
        (should (string-match-p "^\\* TODO Plain" content))))))
 
+(defmacro anvil-org-test--with-logging (&rest body)
+  "Run BODY with state logging into a LOGBOOK and a closing note on DONE."
+  (declare (indent 0))
+  ;; On Windows a batch Emacs can take its own first lock for a stranger's.
+  `(let ((create-lockfiles nil)
+         (org-todo-keywords '((sequence "TODO(t!/!)" "|" "DONE(d!/!)")))
+         (org-log-into-drawer t)
+         (org-log-done 'note)
+         (org-log-repeat 'time)
+         (org-log-note-headings '((done . "%t Closing Note")
+                                  (state . "%t From %-10S to %-10s")
+                                  (note . "%t Note"))))
+     ,@body))
+
+(ert-deftest anvil-org-test-update-todo-state-repeats-repeating-task ()
+  "DONE on a repeating task moves it to its next date and succeeds.
+Org leaves the task TODO after the repeat; the tool must report the
+repeat instead of calling the change blocked."
+  (anvil-org-test--with-logging
+    (anvil-org-test--with-temp-org
+     "* TODO Water the plants\nSCHEDULED: <2026-11-01 Sun +1w>\n"
+     (lambda (path)
+       (let* ((anvil-org-allowed-files (list path))
+              (anvil-org-allowed-files-enabled t)
+              (uri (concat "org-headline://" path "#Water%20the%20plants"))
+              (response (json-parse-string
+                         (anvil-org--tool-update-todo-state uri "TODO" "DONE")
+                         :object-type 'alist))
+              (content (anvil-org-test--read path)))
+         (should (eq t (alist-get 'success response)))
+         (should (eq t (alist-get 'repeated response)))
+         (should (string-match-p "^\\* TODO Water the plants" content))
+         (should (string-match-p "<2026-11-08 Sun \\+1w>" content))
+         (should (string-match-p "From \"TODO\" +to \"DONE\"" content))
+         (should-not (memq #'org-add-log-note post-command-hook)))))))
+
+(ert-deftest anvil-org-test-update-todo-state-stores-log-entry ()
+  "The LOGBOOK entry is stored at once, with the time only."
+  (anvil-org-test--with-logging
+    (anvil-org-test--with-temp-org
+     "* TODO Call the bank\n"
+     (lambda (path)
+       (let* ((anvil-org-allowed-files (list path))
+              (anvil-org-allowed-files-enabled t)
+              (uri (concat "org-headline://" path "#Call%20the%20bank")))
+         (anvil-org--tool-update-todo-state uri "TODO" "DONE")
+         (let ((content (anvil-org-test--read path)))
+           (should (string-match-p "^\\* DONE Call the bank" content))
+           (should (string-match-p ":LOGBOOK:\n- \\[[^]]+\\] From \"TODO\" +to \"DONE\"" content))
+           (should-not (string-match-p "Closing Note" content)))
+         (should-not (memq #'org-add-log-note post-command-hook)))))))
+
+(ert-deftest anvil-org-test-update-todo-state-stores-closing-note ()
+  "A NOTE becomes the text of the entry Org asks a note for.
+With DONE logged as a state change, Org asks the note on that entry."
+  (anvil-org-test--with-logging
+    (anvil-org-test--with-temp-org
+     "* TODO Call the bank\n"
+     (lambda (path)
+       (let* ((anvil-org-allowed-files (list path))
+              (anvil-org-allowed-files-enabled t)
+              (uri (concat "org-headline://" path "#Call%20the%20bank")))
+         (anvil-org--tool-update-todo-state uri "TODO" "DONE" "Card replaced.")
+         (let ((content (anvil-org-test--read path)))
+           (should (string-match-p
+                    "From \"TODO\" +to \"DONE\" +\\\\\\\\\n +Card replaced\\." content)))
+         (should-not (memq #'org-add-log-note post-command-hook)))))))
+
+(ert-deftest anvil-org-test-update-todo-state-waits-for-note-buffer ()
+  "A note being typed in *Org Note* makes the tool refuse to run."
+  (anvil-org-test--with-temp-org
+   "* TODO Call the bank\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (uri (concat "org-headline://" path "#Call%20the%20bank"))
+           (note-buffer (get-buffer-create "*Org Note*")))
+       (unwind-protect
+           (progn
+             (should-error (anvil-org--tool-update-todo-state uri "TODO" "DONE"))
+             (should (string-match-p "^\\* TODO Call the bank"
+                                     (anvil-org-test--read path))))
+         (kill-buffer note-buffer))))))
+
 (ert-deftest anvil-org-test-update-todo-state-errors-when-blocked ()
   "Blocked transitions (org-enforce-todo-dependencies) must surface as errors.
 

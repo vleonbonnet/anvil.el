@@ -1653,12 +1653,39 @@ MCP Parameters:
        (habits . ,(vconcat rows))))))
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: writes via org-todo in real buffer
-(defun anvil-org--tool-update-todo-state (uri current_state new_state)
+(defun anvil-org--store-queued-log-note (&optional note)
+  "Store the log note `org-todo' queued in this buffer, without a window.
+Org stores it from `post-command-hook' after the command that queued
+it, through a note window.  A tool call is no command, so Org would
+drop the note, or store it during a later command of the user's.
+NOTE is the note's text; nil stores the heading line alone.  With a
+NOTE and nothing queued, store NOTE as a plain note on the entry."
+  (when (and note (not (and org-log-setup
+                            (eq (marker-buffer org-log-note-marker)
+                                (current-buffer)))))
+    (org-add-log-setup 'note))
+  (when (and org-log-setup
+             (eq (marker-buffer org-log-note-marker) (current-buffer)))
+    (remove-hook 'post-command-hook #'org-add-log-note)
+    (setq org-log-setup nil)
+    (let ((org-log-note-window-configuration (current-window-configuration)))
+      (move-marker org-log-note-return-to (point) (current-buffer))
+      (with-temp-buffer
+        (when note (insert note))
+        (org-store-log-note)))))
+
+(defun anvil-org--tool-update-todo-state (uri current_state new_state &optional note)
   "Update the TODO state of a headline at URI.
 Creates an Org ID for the headline if one doesn't exist.
 Returns the ID-based URI for the updated headline.
 CURRENT_STATE is the current TODO state (empty string for no state).
 NEW_STATE is the new TODO state to set.
+NOTE is the text of the note Org asks for, such as a closing note.
+
+The change goes through `org-todo', so repeaters, hooks and
+blockers apply as for a change made by hand.  The LOGBOOK entry
+Org queues is stored at once: without NOTE it carries the
+timestamp only, as with `org-inhibit-logging' set to `note'.
 
 MCP Parameters:
   uri - URI of the headline
@@ -1666,16 +1693,25 @@ MCP Parameters:
           - org-headline://{absolute-path}#{headline-path}
           - org-id://{id}
   current_state - Current TODO state (empty string for no state)
-  new_state - New TODO state (must be in `org-todo-keywords')"
+  new_state - New TODO state (must be in `org-todo-keywords')
+  note - Text of the note Org asks for, such as a closing note
+         (optional; without it the LOGBOOK entry has the time only)"
+  ;; `org-todo' would move the note marker under a note being typed.
+  (when (get-buffer "*Org Note*")
+    (anvil-org--tool-validation-error
+     "Org is waiting for a note in *Org Note*; finish or cancel it, then retry"))
   (let* ((parsed (anvil-org--parse-resource-uri uri))
          (file-path (car parsed))
-         (headline-path (cdr parsed)))
+         (headline-path (cdr parsed))
+         (note (and (stringp note) (not (string-blank-p note)) note))
+         (repeated nil))
     (anvil-org--validate-todo-state new_state)
     (anvil-org--modify file-path "update"
                        `((previous_state
                           .
                           ,(or current_state ""))
-                         (new_state . ,new_state))
+                         (new_state . ,new_state)
+                         ,@(when repeated '((repeated . t))))
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
 
@@ -1700,18 +1736,25 @@ MCP Parameters:
       ;; with unfinished children, or a custom `org-blocker-hook' that
       ;; vetoes the change).  Re-read the state from the buffer to
       ;; detect such a no-op and surface it as an error instead of
-      ;; lying about success.
-      (org-todo new_state)
+      ;; lying about success.  A repeater that moved the task to its
+      ;; next date also leaves it in a not-done state; that is success.
+      (let ((mark-repeated (lambda () (setq repeated t))))
+        (add-hook 'org-todo-repeat-hook mark-repeated nil t)
+        (unwind-protect
+            (let ((org-inhibit-logging (if note org-inhibit-logging 'note)))
+              (org-todo new_state))
+          (remove-hook 'org-todo-repeat-hook mark-repeated t)))
       (save-excursion
         (beginning-of-line)
         (let ((post-state (org-get-todo-state)))
-          (unless (equal post-state new_state)
+          (unless (or repeated (equal post-state new_state))
             (anvil-org--tool-validation-error
              (concat "TODO state change blocked: expected '%s', "
                      "headline is still '%s' "
                      "(likely `org-enforce-todo-dependencies' or "
                      "`org-blocker-hook' rejected the transition)")
-             new_state (or post-state "(no state)"))))))))
+             new_state (or post-state "(no state)")))))
+      (anvil-org--store-queued-log-note note))))
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: inserts heading + ID + tags + body in real buffer
 (defun anvil-org--tool-add-todo
@@ -2579,6 +2622,9 @@ Provide either block_name, or both file and line."
    "Update the TODO state of an Org headline.  Changes the task state
 while preserving the headline title, tags, and other properties.
 Creates an Org ID property for the headline if one doesn't exist.
+The change runs `org-todo', as when done by hand: a repeating task
+marked done moves to its next date, state hooks run, and the LOGBOOK
+records the change.
 
 Parameters:
   uri - URI of the headline to update (string, required)
@@ -2590,11 +2636,16 @@ Parameters:
                   Must match actual state or tool will error
   new_state - New TODO state to set (string, required)
               Must be valid keyword from org-todo-keywords
+  note - Text of the note Org asks for, such as a closing note
+         (string, optional; without it the LOGBOOK entry has the
+         time only)
 
 Returns JSON object:
   success - Always true on success (boolean)
   previous_state - The previous TODO state (string, empty for none)
   new_state - The new TODO state that was set (string)
+  repeated - true when a repeater moved the task to its next date,
+             leaving it in a not-done state (present only then)
   uri - ID-based URI (org-id://{uuid}) for the updated headline"
    :read-only nil
    :server-id anvil-org--server-id)

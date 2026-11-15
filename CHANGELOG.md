@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `org-update-todo-state` marks a repeating task done.  Org moves such a task to its next date and leaves it in a not-done state, which the tool took for a blocked change, so it discarded the edit.  The answer now reports `repeated`.
+- `org-update-todo-state` stores the LOGBOOK entry `org-todo` queues at once, with the time only.  Org stores it after the next command, which a tool call is not, so the entry was lost.  A new optional `note` gives the entry's text, such as a closing note.  While a note is being typed in `*Org Note*`, the tool refuses to run: `org-todo` would move that note's marker.
 - The stdio bridge retries emacsclient on MS-Windows too while no server answers yet, as when Emacs restarts.  There emacsclient reaches the server over TCP and reports "error accessing server file" or "connect: " followed by the system's localized message, never "Connection refused", so the bridge failed the request at once.
 
 ## [1.4.1] - 2026-10-04
