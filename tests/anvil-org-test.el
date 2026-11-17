@@ -226,9 +226,7 @@
 (defmacro anvil-org-test--with-logging (&rest body)
   "Run BODY with state logging into a LOGBOOK and a closing note on DONE."
   (declare (indent 0))
-  ;; On Windows a batch Emacs can take its own first lock for a stranger's.
-  `(let ((create-lockfiles nil)
-         (org-todo-keywords '((sequence "TODO(t!/!)" "|" "DONE(d!/!)")))
+  `(let ((org-todo-keywords '((sequence "TODO(t!/!)" "|" "DONE(d!/!)")))
          (org-log-into-drawer t)
          (org-log-done 'note)
          (org-log-repeat 'time)
