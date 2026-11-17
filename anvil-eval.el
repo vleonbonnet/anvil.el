@@ -100,6 +100,23 @@ calls remain available in NeLisp's own global/function tables."
   :type 'boolean
   :group 'anvil-eval)
 
+(defcustom anvil-eval-async-job-wrapper nil
+  "Function that runs the body of each `emacs-eval-async' job, or nil.
+It is called with one argument, a function of no arguments that
+evaluates the job's expression, and must call it and return its
+value.  Async jobs, `org-eval-babel' among them, run later from a
+timer, outside the emacsclient call that queued them, so a wrapper
+around the server request does not reach them; this one does.  Nil
+calls the body directly."
+  :type '(choice (const :tag "None" nil) function)
+  :group 'anvil-eval)
+
+(defun anvil-eval--run-async-job (body)
+  "Call BODY, a job body, through `anvil-eval-async-job-wrapper'."
+  (if anvil-eval-async-job-wrapper
+      (funcall anvil-eval-async-job-wrapper body)
+    (funcall body)))
+
 ;;; Tool timeout
 
 (defun anvil-eval--timeout-advice (orig-fn &rest args)
@@ -394,7 +411,8 @@ MCP Parameters:
                                  (let ((inhibit-quit nil))
                                    (condition-case err
                                        (setq result (anvil-eval--bound-result
-                                                     (format "%S" (eval form t)))
+                                                     (format "%S" (anvil-eval--run-async-job
+                                                                   (lambda () (eval form t)))))
                                              status 'done)
                                      (quit
                                       (setq result "Interrupted by C-g"

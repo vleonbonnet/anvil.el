@@ -162,6 +162,18 @@ outside the timer, so the throw escapes the job lambda entirely."
       (accept-process-output nil 0.01))
     (gethash job-id anvil-eval--async-jobs)))
 
+(ert-deftest anvil-eval-test-async-job-wrapper-runs-body ()
+  "`anvil-eval-async-job-wrapper' runs each async job body and keeps its value."
+  (let* ((anvil-eval--async-jobs (make-hash-table :test 'equal))
+         (anvil-eval--async-counter 0)
+         (wrapped 0)
+         (anvil-eval-async-job-wrapper
+          (lambda (body) (setq wrapped (1+ wrapped)) (funcall body)))
+         (job (anvil-eval-test--run-async "(+ 1 2)")))
+    (should (= wrapped 1))
+    (should (eq (plist-get job :status) 'done))
+    (should (equal (plist-get job :result) "3"))))
+
 (ert-deftest anvil-eval-test-sync-result-within-cap-unchanged ()
   "Results under the cap are returned verbatim."
   (let ((anvil-eval-result-max-chars 100))
