@@ -1283,6 +1283,9 @@ METHOD-METRICS is used to track errors."
               (if handler-params
                   (funcall handler handler-params)
                 (funcall handler)))
+             (anvil-server--modern-result-extra
+              (and anvil-server--modern-request
+                   "\"ttlMs\":0,\"cacheScope\":\"private\""))
              (content-entry
               (anvil-server--append-optional-fields
                `((uri . ,uri) (text . ,content))
@@ -1883,7 +1886,10 @@ Returns a vector of resource entries."
   "Handle resources/list request with ID for SERVER-ID.
 Returns a list of all registered resources with their metadata.
 SERVER-ID is resolved through `anvil-server-id-aliases'."
-  (let* ((resolved-id (anvil-server--resolve-id server-id))
+  (let* ((anvil-server--modern-result-extra
+          (and anvil-server--modern-request
+               "\"ttlMs\":60000,\"cacheScope\":\"private\""))
+         (resolved-id (anvil-server--resolve-id server-id))
          (resources-table
           (gethash resolved-id anvil-server--resources))
          (resource-list
@@ -1898,7 +1904,10 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
   "Handle resources/templates/list request with ID for SERVER-ID.
 Returns a list of all registered resource templates.
 SERVER-ID is resolved through `anvil-server-id-aliases'."
-  (let* ((resolved-id (anvil-server--resolve-id server-id))
+  (let* ((anvil-server--modern-result-extra
+          (and anvil-server--modern-request
+               "\"ttlMs\":60000,\"cacheScope\":\"private\""))
+         (resolved-id (anvil-server--resolve-id server-id))
          (templates-table
           (gethash resolved-id anvil-server--resource-templates))
          (template-list

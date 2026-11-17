@@ -151,5 +151,34 @@ subscriptions/listen stream, which the server does not serve."
     (anvil-server-unregister-tool "guards-sentinel" "guards-caps-test")
     (anvil-server-unregister-resource "guards://resource" "guards-caps-test")))
 
+(ert-deftest anvil-server-dispatch-guards-test-modern-resource-freshness ()
+  "In 2026-07-28 mode, resource lists and reads carry ttlMs and cacheScope."
+  (anvil-server-register-resource "guards://item" (lambda () "payload")
+                                  :name "Item" :server-id "guards-res-test")
+  (anvil-server-register-resource "guards://tpl/{id}"
+                                  (lambda (params) (alist-get "id" params nil nil #'equal))
+                                  :name "Template" :server-id "guards-res-test")
+  (unwind-protect
+      (let* ((anvil-server--running t)
+             (meta '((io.modelcontextprotocol/protocolVersion . "2026-07-28")
+                     (io.modelcontextprotocol/clientCapabilities . #s(hash-table))))
+             (call (lambda (method &optional extra)
+                     (alist-get 'result
+                                (json-read-from-string
+                                 (anvil-server-process-jsonrpc
+                                  (json-encode `((jsonrpc . "2.0") (id . 1) (method . ,method)
+                                                 (params . ((_meta . ,meta) ,@extra))))
+                                  "guards-res-test")))))
+             (listed (funcall call "resources/list"))
+             (templates (funcall call "resources/templates/list"))
+             (read-res (funcall call "resources/read" '((uri . "guards://item")))))
+        (dolist (pair `((,listed . 60000) (,templates . 60000) (,read-res . 0)))
+          (should (equal (alist-get 'resultType (car pair)) "complete"))
+          (should (equal (alist-get 'ttlMs (car pair)) (cdr pair)))
+          (should (equal (alist-get 'cacheScope (car pair)) "private")))
+        (should (equal (alist-get 'text (aref (alist-get 'contents read-res) 0)) "payload")))
+    (anvil-server-unregister-resource "guards://item" "guards-res-test")
+    (anvil-server-unregister-resource "guards://tpl/{id}" "guards-res-test")))
+
 (provide 'anvil-server-dispatch-guards-test)
 ;;; anvil-server-dispatch-guards-test.el ends here
