@@ -729,14 +729,82 @@ anvil_answer() {
 			_anvil_dropped=1
 			mcp_debug_log "CANCELLED" "id=$id: answer dropped"
 			if [[ $3 =~ $_anvil_tools_list_re ]]; then
-				anvil_emit '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' "$2"
+				anvil_announce tools "$2"
 			elif [[ $3 =~ $_anvil_resources_list_re ]]; then
-				anvil_emit '{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}' "$2"
+				anvil_announce resources "$2"
 			fi
 			return 0
 		fi
 	fi
 	anvil_emit "$1" "$2"
+}
+
+# --- Subscriptions ------------------------------------------------------
+# A client of the 2026-07-28 era learns of list changes on a stream it
+# opens with subscriptions/listen, once server/discover declared
+# `listChanged' (Emacs does under `anvil-server-transport-listens', which
+# this bridge binds).  It waits for notifications/subscriptions/acknowledged
+# naming its request, then takes the list_changed notifications that name
+# the subscription.  The bridge serves the stream itself: it acknowledges
+# the lists the client asked for, keeps the subscription until the client
+# cancels it, and sends its announcements there.  A client of the
+# initialize era takes them unsolicited, as before.
+
+_anvil_listen_re='"method"[[:space:]]*:[[:space:]]*"subscriptions/listen"'
+_anvil_listen_tools_re='"toolsListChanged"[[:space:]]*:[[:space:]]*true'
+_anvil_listen_resources_re='"resourcesListChanged"[[:space:]]*:[[:space:]]*true'
+# The subscription's request id as JSON, and the lists it follows.
+_anvil_listen_id=""
+_anvil_listen_tools=0
+_anvil_listen_resources=0
+
+# anvil_listen REQUEST FRAMED
+#
+# Opens the subscription REQUEST asks for, acknowledging the lists it
+# follows.
+anvil_listen() {
+	local honored=""
+	anvil_request_id "$1"
+	_anvil_listen_id="$_anvil_id"
+	_anvil_listen_tools=0
+	_anvil_listen_resources=0
+	if [[ $1 =~ $_anvil_listen_tools_re ]]; then
+		_anvil_listen_tools=1
+		honored='"toolsListChanged":true'
+	fi
+	if [[ $1 =~ $_anvil_listen_resources_re ]]; then
+		_anvil_listen_resources=1
+		honored="${honored:+$honored,}\"resourcesListChanged\":true"
+	fi
+	mcp_debug_log "LISTEN" "id=$_anvil_listen_id tools=$_anvil_listen_tools resources=$_anvil_listen_resources"
+	anvil_emit "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":$_anvil_listen_id},\"notifications\":{$honored}}}" "$2"
+}
+
+# anvil_forget_listen CANCELLATION
+#
+# Closes the subscription a notifications/cancelled CANCELLATION names.
+anvil_forget_listen() {
+	[ -n "$_anvil_listen_id" ] || return 0
+	[[ $1 =~ $_anvil_cancel_id_re ]] || return 0
+	if [ "${BASH_REMATCH[1]}" = "$_anvil_listen_id" ]; then
+		mcp_debug_log "LISTEN-CLOSED" "id=$_anvil_listen_id"
+		_anvil_listen_id=""
+	fi
+}
+
+# anvil_announce LIST FRAMED
+#
+# Tells the client LIST, tools or resources, changed: on its
+# subscription when one follows LIST, else unsolicited.
+anvil_announce() {
+	local follows=$_anvil_listen_tools meta=""
+	if [ "$1" = resources ]; then
+		follows=$_anvil_listen_resources
+	fi
+	if [ -n "$_anvil_listen_id" ] && [ "$follows" = 1 ]; then
+		meta=",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":$_anvil_listen_id}}"
+	fi
+	anvil_emit "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/$1/list_changed\"$meta}" "$2"
 }
 
 # --- Tool list changes --------------------------------------------------
@@ -794,7 +862,7 @@ anvil_note_tools() {
              [ "$_anvil_tools_count" != "$_anvil_tools_announced" ]; then
 		_anvil_tools_announced="$_anvil_tools_count"
 		mcp_debug_log "TOOLS-CHANGED" "count=$_anvil_tools_count listed=$_anvil_tools_listed"
-		anvil_emit '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' "$_anvil_framed"
+		anvil_announce tools "$_anvil_framed"
 	fi
 }
 
@@ -898,7 +966,16 @@ while anvil_read_message; do
 	mcp_debug_log "REQUEST" "$line"
 
 	case "$line" in
-	*'"notifications/cancelled"'*) anvil_cancel_held "$line" ;;
+        *'"notifications/cancelled"'*)
+            anvil_forget_listen "$line"
+            anvil_cancel_held "$line"
+            ;;
+        *'"subscriptions/listen"'*)
+            if [[ $line =~ $_anvil_listen_re ]]; then
+                anvil_listen "$line" "$_anvil_framed"
+                continue
+            fi
+            ;;
 	esac
 
 	# Base64 encode the raw JSON to avoid emacsclient transport issues
@@ -914,9 +991,10 @@ while anvil_read_message; do
 	# Encode the response to base64 to avoid any character encoding issues
 	# Handle nil responses from notifications by converting to empty string.
 	# `anvil-server-deferrable' tells tools this bridge holds deferred answers,
-	# `anvil-server-transport-relists' that it announces lists changed.
+	# `anvil-server-transport-relists' that it announces lists changed, and
+	# `anvil-server-transport-listens' that it serves their subscriptions.
 	# The reply starts with the tool list's count (see Tool list changes).
-	elisp_expr="(base64-encode-string (encode-coding-string (concat (if (fboundp 'anvil-server-tools-generation) (format \"anvil-tools:%s\\n\" (anvil-server-tools-generation \"$SERVER_ID\")) \"\") (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\")) 'utf-8 t) t)"
+	elisp_expr="(base64-encode-string (encode-coding-string (concat (if (fboundp 'anvil-server-tools-generation) (format \"anvil-tools:%s\\n\" (anvil-server-tools-generation \"$SERVER_ID\")) \"\") (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t) (anvil-server-transport-listens t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\")) 'utf-8 t) t)"
 
 	# Get response from emacsclient (with retry across daemon restarts).
 	# The rc is for logging only; an empty response is a soft failure.

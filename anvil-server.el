@@ -1422,11 +1422,19 @@ resources: the bridge then drops the late answer and sends
 notifications/tools/list_changed or notifications/resources/list_changed
 instead.  A client acts on those only when the server declared the
 capability, so initialize declares `listChanged' for the lists the
-server has while this is non-nil.  server/discover does not: a client
-of the 2026-07-28 era that sees it opens a subscriptions/listen
-stream, which this server does not serve.  The bridge also announces
-the tools changed once `anvil-server-tools-generation' moved since the
+server has while this is non-nil.  server/discover declares it only
+under `anvil-server-transport-listens'.  The bridge also announces the
+tools changed once `anvil-server-tools-generation' moved since the
 client last listed them.  Other transports leave it nil.")
+
+(defvar anvil-server-transport-listens nil
+  "Non-nil while the transport serving the request serves subscriptions/listen.
+A client of the 2026-07-28 era that sees `listChanged' in the answer to
+server/discover opens a subscriptions/listen stream and waits for its
+acknowledgement, and the list changes come on that stream.  So
+server/discover declares `listChanged' only while this is non-nil: the
+stdio bridge binds it, as it acknowledges the stream itself and sends
+the announcements of `anvil-server-transport-relists' on it.")
 
 (defun anvil-server--list-capability ()
   "Return the object declaring a tools or resources capability, for `json-encode'.
@@ -1442,12 +1450,17 @@ See `anvil-server-transport-relists'."
   (if anvil-server-transport-relists "{\"listChanged\":true}" "{}"))
 
 (defun anvil-server--capabilities-json (server-id)
-  "Return the capabilities object JSON advertised for SERVER-ID."
+  "Return the capabilities object JSON server/discover advertises for SERVER-ID.
+The lists declare `listChanged' under `anvil-server-transport-listens'."
   (let* ((resolved-id (anvil-server--resolve-id server-id))
          (tools-table (gethash resolved-id anvil-server--tools))
          (resources-table (gethash resolved-id anvil-server--resources))
          (templates-table
-          (gethash resolved-id anvil-server--resource-templates)))
+          (gethash resolved-id anvil-server--resource-templates))
+         (list-capability (if (and anvil-server-transport-relists
+                                   anvil-server-transport-listens)
+                              "{\"listChanged\":true}"
+                            "{}")))
     (concat "{"
             (mapconcat
              #'identity
@@ -1455,12 +1468,12 @@ See `anvil-server-transport-relists'."
                    (list
                     (when (and tools-table
                                (> (hash-table-count tools-table) 0))
-                      "\"tools\":{}")
+                      (concat "\"tools\":" list-capability))
                     (when (or (and resources-table
                                    (> (hash-table-count resources-table) 0))
                               (and templates-table
                                    (> (hash-table-count templates-table) 0)))
-                      "\"resources\":{}")))
+                      (concat "\"resources\":" list-capability))))
              ",")
             "}")))
 

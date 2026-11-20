@@ -65,6 +65,23 @@
      (should (equal "anvil"
                     (alist-get 'name server-info))))))
 
+(ert-deftest anvil-server-modern-era-test-discover-list-changed ()
+  "Discover declares listChanged only for a transport that serves subscriptions."
+  (anvil-server-modern-era-test--with-server
+   (cl-flet ((tools (&rest bindings)
+               (let ((anvil-server-transport-relists (plist-get bindings :relists))
+                     (anvil-server-transport-listens (plist-get bindings :listens)))
+                 (alist-get 'tools
+                            (alist-get 'capabilities
+                                       (alist-get 'result
+                                                  (anvil-server-modern-era-test--call
+                                                   "server/discover"
+                                                   anvil-server-modern-era-test--meta)))))))
+     (should (equal (tools :relists t :listens t) '((listChanged . t))))
+     (should-not (alist-get 'listChanged (tools :relists t)))
+     (should-not (alist-get 'listChanged (tools :listens t)))
+     (should-not (alist-get 'listChanged (tools))))))
+
 (ert-deftest anvil-server-modern-era-test-modern-tools-list ()
   "Modern tools/list returns stateless cache metadata."
   (anvil-server-modern-era-test--with-server

@@ -265,6 +265,56 @@ the waiting cancellation nor wait for input that is not there."
       (should (equal (anvil-stdio-cancel-test--sequence messages)
                      '(1 "notifications/tools/list_changed" 3))))))
 
+(defun anvil-stdio-cancel-test--listen (id filter)
+  "Return the subscriptions/listen request ID for FILTER, JSON, as the SDK words it."
+  (format "{\"jsonrpc\":\"2.0\",\"id\":%s,\"method\":\"subscriptions/listen\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"},\"notifications\":%s}}"
+          id filter))
+
+(defun anvil-stdio-cancel-test--subscription (message)
+  "Return the subscription id in MESSAGE's `_meta', or nil."
+  (alist-get 'io.modelcontextprotocol/subscriptionId
+             (alist-get '_meta (alist-get 'params message))))
+
+(ert-deftest anvil-stdio-cancel-test/listen-acknowledged ()
+  "A subscription is acknowledged for the lists it follows, and its announcements name it."
+  (anvil-stdio-cancel-test--with-fake (dir env bash)
+    (let* ((messages (anvil-stdio-cancel-test--run
+                      (cons "FAKE_TOOLS_COUNTS=0 1" env) bash
+                      (anvil-stdio-cancel-test--input
+                       (anvil-stdio-cancel-test--listen
+                        "\"listen:0\"" "{\"toolsListChanged\":true,\"promptsListChanged\":true}")
+                       (anvil-stdio-cancel-test--request 1 "tools/list")
+                       (anvil-stdio-cancel-test--request 2 "ping"))))
+           (ack (car messages))
+           (changed (car (last messages))))
+      (should (equal (anvil-stdio-cancel-test--sequence messages)
+                     '("notifications/subscriptions/acknowledged" 1 2
+                       "notifications/tools/list_changed")))
+      (should (equal (anvil-stdio-cancel-test--subscription ack) "listen:0"))
+      (should (equal (alist-get 'notifications (alist-get 'params ack))
+                     '((toolsListChanged . t))))
+      (should (equal (anvil-stdio-cancel-test--subscription changed) "listen:0"))
+      ;; Emacs never saw the subscription request.
+      (should-not (string-search "subscriptions/listen"
+                                 (with-temp-buffer
+                                   (insert-file-contents (expand-file-name "requests" dir))
+                                   (buffer-string)))))))
+
+(ert-deftest anvil-stdio-cancel-test/listen-cancelled ()
+  "Once the client cancels its subscription, announcements go unsolicited."
+  (anvil-stdio-cancel-test--with-fake (dir env bash)
+    (let ((messages (anvil-stdio-cancel-test--run
+                     (cons "FAKE_TOOLS_COUNTS=0 0 1" env) bash
+                     (anvil-stdio-cancel-test--input
+                      (anvil-stdio-cancel-test--listen "\"listen:0\"" "{\"toolsListChanged\":true}")
+                      (anvil-stdio-cancel-test--request 1 "tools/list")
+                      (anvil-stdio-cancel-test--cancel "\"listen:0\"")
+                      (anvil-stdio-cancel-test--request 2 "ping")))))
+      (should (equal (anvil-stdio-cancel-test--sequence messages)
+                     '("notifications/subscriptions/acknowledged" 1 2
+                       "notifications/tools/list_changed")))
+      (should-not (anvil-stdio-cancel-test--subscription (car (last messages)))))))
+
 (ert-deftest anvil-stdio-cancel-test/programs-per-request ()
   "A request starts base64, timeout, emacsclient and base64 again, and no other program.
 Starting a program costs about 0.1 s under MSYS2, and the bridge's
