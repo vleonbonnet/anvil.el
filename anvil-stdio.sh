@@ -710,9 +710,10 @@ anvil_forget_cancel() {
 #
 # Sends RESPONSE, the answer to REQUEST, unless the client cancelled
 # REQUEST meanwhile: then it announces the list changed when REQUEST
-# asked for one, and sends nothing else.
+# asked for one, sends nothing else, and sets `_anvil_dropped' to 1.
 anvil_answer() {
 	local id="" head
+	_anvil_dropped=0
 	anvil_drain_input
 	if [ "$_anvil_cancelled" != $'\n' ]; then
 		# Only its start is searched: a response can be megabytes long.
@@ -725,6 +726,7 @@ anvil_answer() {
 		fi
 		if [ -n "$id" ] && [[ $_anvil_cancelled == *$'\n'"$id"$'\n'* ]]; then
 			anvil_forget_cancel "$id"
+			_anvil_dropped=1
 			mcp_debug_log "CANCELLED" "id=$id: answer dropped"
 			if [[ $3 =~ $_anvil_tools_list_re ]]; then
 				anvil_emit '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' "$2"
@@ -735,6 +737,65 @@ anvil_answer() {
 		fi
 	fi
 	anvil_emit "$1" "$2"
+}
+
+# --- Tool list changes --------------------------------------------------
+# A client lists the tools once, when it connects, and again only when
+# told the list changed, so a tool Emacs registers later stays out of
+# reach until the client restarts.  Emacs counts the changes of each
+# server's tool list (`anvil-server-tools-generation'), and every reply
+# begins with the count taken before its request ran, on a line of its
+# own: "anvil-tools:COUNT".  The bridge remembers the count of the last
+# tools/list it answered, and once a later reply brings another count,
+# it announces the list changed after that reply, once per count.  An
+# Emacs whose Anvil does not count sends no such line, and nothing is
+# announced.
+
+_anvil_tools_count=""
+_anvil_tools_listed=""
+_anvil_tools_announced=""
+
+# anvil_take_tools_count
+#
+# Removes the count line from the start of `formatted_response', if it
+# is there, into `_anvil_tools_count'; empties it otherwise.  The reply
+# to a notification is the count alone, its newline gone with the
+# decoding's command substitution.
+anvil_take_tools_count() {
+	local head line
+	_anvil_tools_count=""
+	# Only its start is searched: a response can be megabytes long.
+	head="${formatted_response:0:64}"
+	[[ $head == anvil-tools:* ]] || return 0
+	if [[ $head == *$'\n'* ]]; then
+		line="${head%%$'\n'*}"
+		formatted_response="${formatted_response:${#line}+1}"
+	elif [[ $formatted_response =~ ^anvil-tools:[0-9]+$ ]]; then
+		line="$formatted_response"
+		formatted_response=""
+	else
+		return 0
+	fi
+	_anvil_tools_count="${line#anvil-tools:}"
+}
+
+# anvil_note_tools REQUEST
+#
+# Remembers the count a tools/list REQUEST was answered with, or
+# announces the tool list changed when the count moved since.
+anvil_note_tools() {
+	[ -n "$_anvil_tools_count" ] || return 0
+	if [[ $1 =~ $_anvil_tools_list_re ]]; then
+		if [ "$_anvil_dropped" != 1 ]; then
+			_anvil_tools_listed="$_anvil_tools_count"
+		fi
+	elif [ -n "$_anvil_tools_listed" ] &&
+             [ "$_anvil_tools_count" != "$_anvil_tools_listed" ] &&
+             [ "$_anvil_tools_count" != "$_anvil_tools_announced" ]; then
+		_anvil_tools_announced="$_anvil_tools_count"
+		mcp_debug_log "TOOLS-CHANGED" "count=$_anvil_tools_count listed=$_anvil_tools_listed"
+		anvil_emit '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' "$_anvil_framed"
+	fi
 }
 
 # --- Deferred answers ---------------------------------------------------
@@ -854,12 +915,15 @@ while anvil_read_message; do
 	# Handle nil responses from notifications by converting to empty string.
 	# `anvil-server-deferrable' tells tools this bridge holds deferred answers,
 	# `anvil-server-transport-relists' that it announces lists changed.
-	elisp_expr="(base64-encode-string (encode-coding-string (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\") 'utf-8 t) t)"
+	# The reply starts with the tool list's count (see Tool list changes).
+	elisp_expr="(base64-encode-string (encode-coding-string (concat (if (fboundp 'anvil-server-tools-generation) (format \"anvil-tools:%s\\n\" (anvil-server-tools-generation \"$SERVER_ID\")) \"\") (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\")) 'utf-8 t) t)"
 
 	# Get response from emacsclient (with retry across daemon restarts).
 	# The rc is for logging only; an empty response is a soft failure.
 	anvil_call_emacs "$elisp_expr"
 	formatted_response="$_anvil_reply"
+	anvil_take_tools_count
+	_anvil_dropped=0
 
 	mcp_debug_log "RESPONSE" "$formatted_response"
 
@@ -900,6 +964,7 @@ while anvil_read_message; do
 		fi
 		;;
 	esac
+	anvil_note_tools "$line"
 done
 
 # Stop MCP if stop function is provided

@@ -216,6 +216,55 @@ the waiting cancellation nor wait for input that is not there."
         (kill-buffer output)
         (kill-buffer errors)))))
 
+(defun anvil-stdio-cancel-test--sequence (messages)
+  "Return MESSAGES as a list of answered ids and notification methods, in order."
+  (mapcar (lambda (message) (or (alist-get 'id message) (alist-get 'method message)))
+          messages))
+
+(ert-deftest anvil-stdio-cancel-test/tools-changed-announced ()
+  "Once the tool list's count moves past the one last listed, the tools are announced changed once."
+  (anvil-stdio-cancel-test--with-fake (dir env bash)
+    (let ((messages (anvil-stdio-cancel-test--run
+                     (cons "FAKE_TOOLS_COUNTS=0 0 1 1" env) bash
+                     (anvil-stdio-cancel-test--input
+                      (anvil-stdio-cancel-test--request 1 "tools/list")
+                      (anvil-stdio-cancel-test--request 2 "ping")
+                      (anvil-stdio-cancel-test--request 3 "tools/call")
+                      (anvil-stdio-cancel-test--request 4 "ping")))))
+      (should (equal (anvil-stdio-cancel-test--sequence messages)
+                     '(1 2 3 "notifications/tools/list_changed" 4)))
+      ;; The count line is not part of the answer.
+      (should (alist-get 'tools (alist-get 'result (car messages)))))))
+
+(ert-deftest anvil-stdio-cancel-test/tools-changed-after-relisting ()
+  "A list taken after an announcement sets the count later changes are measured from."
+  (anvil-stdio-cancel-test--with-fake (dir env bash)
+    (let ((messages (anvil-stdio-cancel-test--run
+                     (cons "FAKE_TOOLS_COUNTS=0 1 1 1 2" env) bash
+                     (anvil-stdio-cancel-test--input
+                      (anvil-stdio-cancel-test--request 1 "tools/list")
+                      (anvil-stdio-cancel-test--request 2 "ping")
+                      (anvil-stdio-cancel-test--request 3 "tools/list")
+                      (anvil-stdio-cancel-test--request 4 "ping")
+                      (anvil-stdio-cancel-test--request 5 "ping")))))
+      (should (equal (anvil-stdio-cancel-test--sequence messages)
+                     '(1 2 "notifications/tools/list_changed" 3 4 5
+                         "notifications/tools/list_changed"))))))
+
+(ert-deftest anvil-stdio-cancel-test/tools-changed-needs-a-list ()
+  "Nothing is announced before the client listed the tools, nor when a cancelled list moved the count."
+  (anvil-stdio-cancel-test--with-fake (dir env bash)
+    (let ((messages (anvil-stdio-cancel-test--run
+                     (cons "FAKE_TOOLS_COUNTS=3 4 5" env) bash
+                     (anvil-stdio-cancel-test--input
+                      (anvil-stdio-cancel-test--request 1 "ping")
+                      (anvil-stdio-cancel-test--request 2 "tools/list")
+                      (anvil-stdio-cancel-test--cancel 2)
+                      (anvil-stdio-cancel-test--request 3 "ping")))))
+      ;; The cancelled list is announced changed, as before; no count was listed.
+      (should (equal (anvil-stdio-cancel-test--sequence messages)
+                     '(1 "notifications/tools/list_changed" 3))))))
+
 (ert-deftest anvil-stdio-cancel-test/programs-per-request ()
   "A request starts base64, timeout, emacsclient and base64 again, and no other program.
 Starting a program costs about 0.1 s under MSYS2, and the bridge's

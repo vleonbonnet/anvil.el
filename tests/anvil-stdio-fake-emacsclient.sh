@@ -11,7 +11,10 @@
 # for the bridge once it answers.  FAKE_BASE64 and FAKE_SLEEP name the
 # programs it uses, so that it runs on a PATH holding no other.  Each
 # call appends "emacsclient" to `calls' and the request to `requests',
-# beside the script.
+# beside the script.  With FAKE_TOOLS_COUNTS, counts separated by
+# spaces, a reply to an expression asking for the tool list's count
+# begins with it, as Anvil's does: the Nth call answers the Nth count,
+# and later calls the last.
 
 dir=${0%/*}
 printf 'emacsclient\n' >>"$dir/calls"
@@ -33,13 +36,30 @@ if [ ! -e "$dir/answered" ]; then
 		"$FAKE_SLEEP" "$FAKE_FIRST_DELAY"
 	fi
 fi
+count_line=
+if [ -n "${FAKE_TOOLS_COUNTS:-}" ] && [[ $expr == *anvil-server-tools-generation* ]]; then
+	read -r -a counts <<<"$FAKE_TOOLS_COUNTS"
+	n=0
+	while IFS= read -r _; do
+		n=$((n + 1))
+	done <"$dir/calls"
+	if [ "$n" -gt "${#counts[@]}" ]; then
+		n=${#counts[@]}
+	fi
+	count_line="anvil-tools:${counts[n - 1]}"$'\n'
+fi
 id=
 re='"id":(-?[0-9]+|"[^"]*")'
 if [[ $req =~ $re ]]; then
 	id=${BASH_REMATCH[1]}
 fi
 if [ -z "$id" ]; then
-	printf '""\n'
+	if [ -n "$count_line" ]; then
+		enc=$(printf '%s' "$count_line" | "$FAKE_BASE64")
+		printf '"%s"\n' "${enc//$'\n'/}"
+	else
+		printf '""\n'
+	fi
 	exit 0
 fi
 case $req in
@@ -51,5 +71,5 @@ case $req in
 	;;
 *) result='{}' ;;
 esac
-enc=$(printf '{"jsonrpc":"2.0","id":%s,"result":%s}' "$id" "$result" | "$FAKE_BASE64")
+enc=$(printf '%s{"jsonrpc":"2.0","id":%s,"result":%s}' "$count_line" "$id" "$result" | "$FAKE_BASE64")
 printf '"%s"\n' "${enc//$'\n'/}"

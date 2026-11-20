@@ -636,6 +636,24 @@ cached-fragment preload uses; nil SERVER-ID drops every entry."
       (dolist (key stale)
         (remhash key anvil-server--tools-list-cache)))))
 
+(defvar anvil-server--tools-generations (make-hash-table :test 'equal)
+  "Hash table mapping a server id to how many times its tool list changed.
+A tool registered anew or unregistered for good counts; registering one
+already there only adds a reference, so it does not.")
+
+(defun anvil-server--tools-changed (server-id)
+  "Count a change of SERVER-ID's tool list."
+  (puthash server-id (1+ (gethash server-id anvil-server--tools-generations 0))
+           anvil-server--tools-generations))
+
+(defun anvil-server-tools-generation (server-id)
+  "Return how many times the tool list of SERVER-ID changed in this Emacs.
+SERVER-ID may be virtual.  The count starts at 0 with Emacs, so only a
+difference between two counts means something: a transport that
+remembers the count at a client's last tools/list tells that client
+the list changed once the count differs.  The stdio bridge does."
+  (gethash (anvil-server--resolve-id server-id) anvil-server--tools-generations 0))
+
 (defun anvil-server--jsonrpc-response-from-result-json (id result-json)
   "Build a JSON-RPC response by wrapping a pre-encoded RESULT-JSON string.
 ID is encoded inline.  Used by the tools/list cache fast path to skip
@@ -1406,8 +1424,9 @@ instead.  A client acts on those only when the server declared the
 capability, so initialize declares `listChanged' for the lists the
 server has while this is non-nil.  server/discover does not: a client
 of the 2026-07-28 era that sees it opens a subscriptions/listen
-stream, which this server does not serve.  Other transports leave it
-nil.")
+stream, which this server does not serve.  The bridge also announces
+the tools changed once `anvil-server-tools-generation' moved since the
+client last listed them.  Other transports leave it nil.")
 
 (defun anvil-server--list-capability ()
   "Return the object declaring a tools or resources capability, for `json-encode'.
@@ -2905,6 +2924,7 @@ See also:
            annotations))
         ;; Register the tool
         (anvil-server--ref-counted-register id tool tools-table)
+        (anvil-server--tools-changed server-id)
         ;; Perf (2026-05-11): tools/list response is cached per server-id;
         ;; drop the cached entry so the next /list rebuilds with the new tool.
         (anvil-server--tools-list-cache-invalidate server-id)))))
@@ -2923,6 +2943,8 @@ See also: `anvil-server-register-tool'"
     ;; Perf (2026-05-11): drop the cached tools/list response so the
     ;; next /list rebuilds without the removed tool.
     (when removed
+      (unless (gethash tool-id tools-table)
+        (anvil-server--tools-changed effective-id))
       (anvil-server--tools-list-cache-invalidate effective-id))
     removed))
 

@@ -325,6 +325,37 @@ MCP Parameters:
       (when (file-exists-p cache-file)
         (delete-file cache-file)))))
 
+(ert-deftest anvil-test-tools-generation-counts-list-changes ()
+  "The tool list's count moves when a tool comes or goes, not when one is registered again."
+  (defun anvil-test--counted-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-generation")
+         (anvil-server-id-aliases (cons (cons "anvil-test-generation-alias" server-id)
+                                        anvil-server-id-aliases))
+         (count (lambda () (anvil-server-tools-generation server-id))))
+    (unwind-protect
+        (let ((start (funcall count)))
+          (anvil-server-register-tool #'anvil-test--counted-tool
+                                      :id "counted" :description "Counted"
+                                      :server-id server-id)
+          (should (= (funcall count) (1+ start)))
+          ;; Another reference to the same tool leaves the list as it was.
+          (anvil-server-register-tool #'anvil-test--counted-tool
+                                      :id "counted" :description "Counted"
+                                      :server-id server-id)
+          (should (= (funcall count) (1+ start)))
+          (anvil-server-unregister-tool "counted" server-id)
+          (should (= (funcall count) (1+ start)))
+          (anvil-server-unregister-tool "counted" server-id)
+          (should (= (funcall count) (+ 2 start)))
+          (should (= (anvil-server-tools-generation "anvil-test-generation-alias") (+ 2 start)))
+          (should-not (anvil-server-unregister-tool "counted" server-id))
+          (should (= (funcall count) (+ 2 start))))
+      (remhash server-id anvil-server--tools)
+      (remhash server-id anvil-server--tools-generations)
+      (anvil-server--tools-list-cache-invalidate server-id))))
+
 (ert-deftest anvil-test-schema-cache-signature-does-not-read-docstring ()
   "Signature construction must be stable before cache lookup."
   (cl-letf (((symbol-function 'documentation)
