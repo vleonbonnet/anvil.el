@@ -19,6 +19,15 @@
 ;;    the completion step's `org-id-get-create' returned (or minted)
 ;;    the neighbouring heading's ID while the new task got no ID
 ;;    drawer at all.
+;;
+;; 4. Top-level placement: a parent_uri naming only the file inserted
+;;    the heading at the first line that was neither a #+ keyword nor
+;;    blank.  Any other preamble, such as a file-level :PROPERTIES:
+;;    drawer, was turned into the new heading by `org-insert-heading',
+;;    so the heading swallowed the drawer's opening line.  A top-level
+;;    task now goes after the last top-level subtree, like a child goes
+;;    after its last sibling; position and after_uri apply as they do
+;;    for children.
 
 ;;; Code:
 
@@ -169,6 +178,119 @@ capture)."
       (should (string-match-p (concat "\\*\\* TODO Structured\n:PROPERTIES:\n:ID: +"
                                       (regexp-quote id))
                               content)))))
+
+;;; Top-level placement
+
+(defconst anvil-org-add-todo-optional-test--file-drawer
+  ":PROPERTIES:\n:ID:       file-level-id-0001\n:END:\n#+TITLE: Tasks\n\n"
+  "A file-level property drawer and keyword, as Org files open with.")
+
+(defun anvil-org-add-todo-optional-test--add-top (path &rest args)
+  "Add top-level task \"New\" to PATH with ARGS; return the parsed reply.
+ARGS are body, after_uri, tags and position, as for the tool."
+  (json-parse-string
+   (apply #'anvil-org--tool-add-todo
+          "New" "TODO" (concat "org-headline://" path) args)
+   :object-type 'alist))
+
+(defun anvil-org-add-todo-optional-test--uri-id (response)
+  "Return the ID in RESPONSE's org-id:// URI."
+  (string-remove-prefix "org-id://" (alist-get 'uri response)))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-keeps-file-drawer ()
+  "A top-level task leaves the file-level drawer intact and gets its own ID."
+  (anvil-org-add-todo-optional-test--with-org
+      (concat anvil-org-add-todo-optional-test--file-drawer
+              "* First\nText.\n* Second\n** Child\n")
+    (let* ((response (anvil-org-add-todo-optional-test--add-top path))
+           (content (anvil-org-add-todo-optional-test--read path))
+           (id (anvil-org-add-todo-optional-test--uri-id response)))
+      (should (eq t (alist-get 'success response)))
+      (should (string-prefix-p anvil-org-add-todo-optional-test--file-drawer
+                               content))
+      (should-not (equal id "file-level-id-0001"))
+      (should (string-match-p
+               (concat "^\\* TODO New\n:PROPERTIES:\n:ID: +"
+                       (regexp-quote id) "\n:END:\n")
+               content)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-appends-last ()
+  "Without position or after_uri, a top-level task follows the last subtree."
+  (anvil-org-add-todo-optional-test--with-org
+      (concat anvil-org-add-todo-optional-test--file-drawer
+              "* First\nText.\n* Second\n** Child\n")
+    (anvil-org-add-todo-optional-test--add-top path)
+    (let ((content (anvil-org-add-todo-optional-test--read path)))
+      (should (string-match-p
+               "^\\* First\nText\\.\n\\* Second\n\\*\\* Child\n\n?\\* TODO New\n"
+               content)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-keeps-plain-preamble ()
+  "Preamble text that is not a #+ keyword stays as it was."
+  (anvil-org-add-todo-optional-test--with-org
+      "Intro paragraph.\n# A comment\n* First\n"
+    (anvil-org-add-todo-optional-test--add-top path)
+    (let ((content (anvil-org-add-todo-optional-test--read path)))
+      (should (string-prefix-p "Intro paragraph.\n# A comment\n* First\n"
+                               content))
+      (should (string-match-p "^\\* First\n\n?\\* TODO New\n" content)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-without-headings ()
+  "In a file with only a preamble, the task follows the preamble."
+  (anvil-org-add-todo-optional-test--with-org
+      anvil-org-add-todo-optional-test--file-drawer
+    (let* ((response (anvil-org-add-todo-optional-test--add-top
+                      path "Body line."))
+           (content (anvil-org-add-todo-optional-test--read path)))
+      (should (string-prefix-p anvil-org-add-todo-optional-test--file-drawer
+                               content))
+      (should-not (equal (anvil-org-add-todo-optional-test--uri-id response)
+                         "file-level-id-0001"))
+      (should (string-match-p
+               "^\\* TODO New\n:PROPERTIES:\n:ID: +[^\n]+\n:END:\n\nBody line\\.\n"
+               content)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-position-first ()
+  "POSITION=\"first\" puts the task before the first heading, after the preamble."
+  (anvil-org-add-todo-optional-test--with-org
+      (concat anvil-org-add-todo-optional-test--file-drawer "* First\nText.\n")
+    (anvil-org-add-todo-optional-test--add-top path nil nil nil "first")
+    (let ((content (anvil-org-add-todo-optional-test--read path)))
+      (should (string-prefix-p anvil-org-add-todo-optional-test--file-drawer
+                               content))
+      (should (string-match-p "^\\* TODO New\n[^*]*\\* First\nText\\.\n"
+                              content)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-after-uri ()
+  "AFTER_URI places a top-level task after that top-level sibling's subtree."
+  (anvil-org-add-todo-optional-test--with-org
+      (concat anvil-org-add-todo-optional-test--file-drawer
+              "* A\n:PROPERTIES:\n:ID:       55555555-aaaa-bbbb-cccc-000000000001\n:END:\n** A child\n* B\n")
+    (anvil-org-add-todo-optional-test--add-top
+     path nil "org-id://55555555-aaaa-bbbb-cccc-000000000001")
+    (let ((content (anvil-org-add-todo-optional-test--read path)))
+      (should (string-match-p "^\\*\\* A child\n\n?\\* TODO New\n[^*]*\\* B\n"
+                              content)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-after-uri-not-top ()
+  "AFTER_URI naming a non-top-level heading is a validation error."
+  (anvil-org-add-todo-optional-test--with-org
+      "* A\n** Nested\n:PROPERTIES:\n:ID:       55555555-aaaa-bbbb-cccc-000000000002\n:END:\n"
+    (should-error
+     (anvil-org-add-todo-optional-test--add-top
+      path nil "org-id://55555555-aaaa-bbbb-cccc-000000000002"))
+    (should (equal (anvil-org-add-todo-optional-test--read path)
+                   "* A\n** Nested\n:PROPERTIES:\n:ID:       55555555-aaaa-bbbb-cccc-000000000002\n:END:\n"))))
+
+(ert-deftest anvil-org-add-todo-optional-test-top-level-validates-position ()
+  "Top-level calls validate POSITION as child calls do."
+  (anvil-org-add-todo-optional-test--with-org "* A\n"
+    (should-error
+     (anvil-org-add-todo-optional-test--add-top path nil nil nil "frist"))
+    (should-error
+     (anvil-org-add-todo-optional-test--add-top
+      path nil "org-id://55555555-aaaa-bbbb-cccc-000000000003" nil "first"))
+    (should (equal (anvil-org-add-todo-optional-test--read path) "* A\n"))))
 
 (provide 'anvil-org-add-todo-optional-test)
 ;;; anvil-org-add-todo-optional-test.el ends here

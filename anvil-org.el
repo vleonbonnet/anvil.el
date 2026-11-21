@@ -1316,30 +1316,79 @@ Empty or nil VALUE returns nil."
     (nreverse rows)))
 
 (defun anvil-org--navigate-to-parent-or-top (parent-path parent-id)
-  "Navigate to parent headline or top of file.
+  "Navigate to parent headline, if any.
 PARENT-PATH is a list of headline titles (or nil for top-level).
 PARENT-ID is an ID string (or nil).
 Returns parent level (integer) if parent exists, nil for top-level.
+For top-level, point does not move:
+`anvil-org--position-for-new-top-level' places it.
 Assumes point is in an Org buffer."
-  (if (or parent-path parent-id)
-      (progn
-        (anvil-org--goto-headline-from-uri
-         (or (and parent-id (list parent-id)) parent-path) parent-id)
-        ;; Save parent level before moving point
-        ;; Ensure we're at the beginning of headline
-        (org-back-to-heading t)
-        (org-current-level))
-    ;; No parent specified - top level
-    ;; Skip past any header comments (#+TITLE, #+AUTHOR, etc.)
-    (while (and (not (eobp)) (looking-at "^#\\+"))
-      (forward-line))
-    ;; Position correctly: if blank line after headers,
-    ;; skip it; if headline immediately after, stay
-    (when (and (not (eobp)) (looking-at "^[ \t]*$"))
-      ;; On blank line after headers, skip
-      (while (and (not (eobp)) (looking-at "^[ \t]*$"))
-        (forward-line)))
-    nil))
+  (when (or parent-path parent-id)
+    (anvil-org--goto-headline-from-uri
+     (or (and parent-id (list parent-id)) parent-path) parent-id)
+    ;; Save parent level before moving point
+    ;; Ensure we're at the beginning of headline
+    (org-back-to-heading t)
+    (org-current-level)))
+
+(defun anvil-org--validate-new-heading-position (after-uri position)
+  "Signal a validation error unless AFTER-URI and POSITION can combine.
+POSITION must be nil, empty or \"first\", and \"first\" excludes a
+non-empty AFTER-URI."
+  (when (and position
+             (not (string-empty-p position))
+             (not (equal position "first")))
+    (anvil-org--tool-validation-error
+     "Field position must be \"first\" when provided: %s"
+     position))
+  (when (and (equal position "first")
+             after-uri
+             (not (string-empty-p after-uri)))
+    (anvil-org--tool-validation-error
+     "position=\"first\" is mutually exclusive with after_uri")))
+
+(defun anvil-org--after-uri-id (after-uri)
+  "Return the Org ID in AFTER-URI, an org-id:// URI.
+Throws validation error if AFTER-URI has another form."
+  (or (anvil-org--extract-uri-suffix after-uri anvil-org--uri-id-prefix)
+      (anvil-org--tool-validation-error
+       "Field after_uri is not %s: %s"
+       anvil-org--uri-id-prefix after-uri)))
+
+(defun anvil-org--position-for-new-top-level (after-uri &optional position)
+  "Position point for inserting a new top-level heading.
+Point always ends at the start of a heading line or at the end of
+the buffer, never inside the text before the first heading (keywords,
+a file-level property drawer, comments or plain text), which a
+heading inserted there would split.
+If POSITION is \"first\", positions point at the first heading, or
+at the end of the buffer when there is none; combining it with
+AFTER-URI is a validation error.
+Otherwise: if AFTER-URI is non-nil, positions after the subtree of
+that top-level heading; if nil, positions at the end of the buffer.
+Throws validation error if AFTER-URI is invalid or names no
+top-level heading."
+  (anvil-org--validate-new-heading-position after-uri position)
+  (cond
+   ((equal position "first")
+    (goto-char (point-min))
+    (if (re-search-forward org-outline-regexp-bol nil t)
+        (goto-char (match-beginning 0))
+      (goto-char (point-max))))
+   ((and after-uri (not (string-empty-p after-uri)))
+    (let* ((after-id (anvil-org--after-uri-id after-uri))
+           (pos (org-find-entry-with-id after-id)))
+      (unless (and pos
+                   (save-excursion
+                     (goto-char pos)
+                     (eql (org-current-level) 1)))
+        (anvil-org--tool-validation-error
+         "Top-level heading with ID %s not found in file"
+         after-id))
+      (goto-char pos)
+      (org-end-of-subtree t t)))
+   (t
+    (goto-char (point-max)))))
 
 (defun anvil-org--position-for-new-child (after-uri parent-end &optional position)
   "Position point for inserting a new child under current heading.
@@ -1352,30 +1401,14 @@ combining it with AFTER-URI is a validation error.
 Otherwise: if AFTER-URI is non-nil, positions after that sibling;
 if nil, positions at end of parent's subtree.
 Throws validation error if AFTER-URI is invalid or sibling not found."
-  (when (and position
-             (not (string-empty-p position))
-             (not (equal position "first")))
-    (anvil-org--tool-validation-error
-     "Field position must be \"first\" when provided: %s"
-     position))
-  (when (and (equal position "first")
-             after-uri
-             (not (string-empty-p after-uri)))
-    (anvil-org--tool-validation-error
-     "position=\"first\" is mutually exclusive with after_uri"))
+  (anvil-org--validate-new-heading-position after-uri position)
   (if (equal position "first")
       (progn (org-back-to-heading t) (org-end-of-meta-data t))
     (if (and after-uri (not (string-empty-p after-uri)))
         (progn
           ;; Parse afterUri to get the ID
-          (let ((after-id
-                 (anvil-org--extract-uri-suffix
-                  after-uri anvil-org--uri-id-prefix))
+          (let ((after-id (anvil-org--after-uri-id after-uri))
                 (found nil))
-            (unless after-id
-              (anvil-org--tool-validation-error
-               "Field after_uri is not %s: %s"
-               anvil-org--uri-id-prefix after-uri))
             ;; Find the sibling with the specified ID
             (org-back-to-heading t) ;; At parent
             ;; Search sibling in parent's subtree
@@ -1784,7 +1817,8 @@ MCP Parameters:
                 - org-id://{id}
   tags - Tags to add (single string, JSON array string, or empty for
          none; optional)
-  position - \"first\" to insert as parent's first child (optional;
+  position - \"first\" to insert as parent's first child, or for
+             top-level before the file's first heading (optional;
              mutually exclusive with after_uri)"
   (anvil-org--validate-headline-title title)
   (anvil-org--validate-todo-state todo_state)
@@ -1822,12 +1856,13 @@ MCP Parameters:
               parent-path parent-id)))
 
         ;; Handle positioning after navigation to parent
-        (when (or parent-path parent-id)
-          (let ((parent-end
-                 (save-excursion
-                   (org-end-of-subtree t t)
-                   (point))))
-            (anvil-org--position-for-new-child after_uri parent-end position)))
+        (if (or parent-path parent-id)
+            (let ((parent-end
+                   (save-excursion
+                     (org-end-of-subtree t t)
+                     (point))))
+              (anvil-org--position-for-new-child after_uri parent-end position))
+          (anvil-org--position-for-new-top-level after_uri position))
 
         ;; Validate body before inserting heading
         ;; Calculate the target level for validation
@@ -2682,7 +2717,9 @@ Parameters:
   after_uri - Sibling to insert after (string, optional)
               Must be org-id://{uuid} format
               If omitted, appends as last child of parent
+              For top-level: a top-level heading of the same file
   position - \"first\" inserts as parent's first child (string, optional)
+             For top-level: before the file's first heading
              Mutually exclusive with after_uri
 
 Returns JSON object:
@@ -2695,7 +2732,9 @@ Positioning behavior:
   - With parent_uri only: Appends as last child of parent
   - With parent_uri + after_uri: Inserts immediately after specified
 sibling
-  - Top-level (parent_uri with no fragment): Adds at end of file."
+  - Top-level (parent_uri with no fragment): Adds at end of file;
+position and after_uri apply as for children.  Text before the first
+heading (keywords, a file-level property drawer) is never split."
    :read-only nil
    :server-id anvil-org--server-id)
 
