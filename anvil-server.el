@@ -1436,6 +1436,17 @@ server/discover declares `listChanged' only while this is non-nil: the
 stdio bridge binds it, as it acknowledges the stream itself and sends
 the announcements of `anvil-server-transport-relists' on it.")
 
+(defvar anvil-server-transport-pid nil
+  "Process identifier of the transport serving the request, or nil.
+The stdio bridge binds it as it dispatches a request: its own process,
+as the system names it, which `process-attributes' takes (under MSYS2
+or Cygwin, the Windows identifier).  The MCP client started the bridge,
+so the client is the bridge's parent, or above it when a program
+starts the bridge for it.  A tool can then tell which client calls
+even when the request does not say, as with Claude Code, whose
+`anvil-server-request-meta' names no session.  Other transports leave
+it nil.")
+
 (defun anvil-server--list-capability ()
   "Return the object declaring a tools or resources capability, for `json-encode'.
 See `anvil-server-transport-relists'."

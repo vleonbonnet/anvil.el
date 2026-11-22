@@ -87,6 +87,22 @@ _anvil_state="${_anvil_state%/}/anvil-stdio-$$"
 _anvil_out_lock="$_anvil_state.lock"
 _anvil_main="$_anvil_state.main"
 
+# --- The bridge's process ---------------------------------------------
+# Each request tells Emacs the bridge's process, as the system names
+# it, in `anvil-server-transport-pid': the client started the bridge,
+# so a tool finds the client above it.  Under MSYS2 and Cygwin `$$' is
+# the emulation's own number, which Emacs does not know, and /proc
+# gives the Windows one.  It is read with `read', starting no program.
+if [ -r "/proc/$$/winpid" ]; then
+	_anvil_pid=
+	read -r _anvil_pid <"/proc/$$/winpid" || :
+else
+	_anvil_pid=$$
+fi
+case $_anvil_pid in
+'' | *[!0-9]*) _anvil_pid=nil ;;
+esac
+
 anvil_cleanup() {
 	local hold pid job
 	for hold in "$_anvil_state".hold-*; do
@@ -991,10 +1007,11 @@ while anvil_read_message; do
 	# Encode the response to base64 to avoid any character encoding issues
 	# Handle nil responses from notifications by converting to empty string.
 	# `anvil-server-deferrable' tells tools this bridge holds deferred answers,
-	# `anvil-server-transport-relists' that it announces lists changed, and
-	# `anvil-server-transport-listens' that it serves their subscriptions.
+	# `anvil-server-transport-relists' that it announces lists changed,
+	# `anvil-server-transport-listens' that it serves their subscriptions,
+	# and `anvil-server-transport-pid' its process (see The bridge's process).
 	# The reply starts with the tool list's count (see Tool list changes).
-	elisp_expr="(base64-encode-string (encode-coding-string (concat (if (fboundp 'anvil-server-tools-generation) (format \"anvil-tools:%s\\n\" (anvil-server-tools-generation \"$SERVER_ID\")) \"\") (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t) (anvil-server-transport-listens t)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\")) 'utf-8 t) t)"
+	elisp_expr="(base64-encode-string (encode-coding-string (concat (if (fboundp 'anvil-server-tools-generation) (format \"anvil-tools:%s\\n\" (anvil-server-tools-generation \"$SERVER_ID\")) \"\") (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t) (anvil-server-transport-listens t) (anvil-server-transport-pid $_anvil_pid)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\")) 'utf-8 t) t)"
 
 	# Get response from emacsclient (with retry across daemon restarts).
 	# The rc is for logging only; an empty response is a soft failure.

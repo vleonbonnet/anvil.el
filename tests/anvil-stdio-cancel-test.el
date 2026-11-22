@@ -13,7 +13,9 @@
 ;; lists again, and answer the later request.  They run the real
 ;; anvil-stdio.sh against tests/anvil-stdio-fake-emacsclient.sh, so
 ;; they need only bash and coreutils and run on MS-Windows (MSYS2) as
-;; well.  The last test checks which programs a request starts.
+;; well.  Others check the announcements of a changed tool list and the
+;; process each request names (`anvil-server-transport-pid'), and the
+;; last which programs a request starts.
 
 ;;; Code:
 
@@ -215,6 +217,39 @@ the waiting cancellation nor wait for input that is not there."
           (delete-process process))
         (kill-buffer output)
         (kill-buffer errors)))))
+
+(ert-deftest anvil-stdio-cancel-test/transport-pid ()
+  "Each request binds `anvil-server-transport-pid' to the bridge's process.
+It is the identifier its parent knows it by, here Emacs: under MSYS2
+the Windows one, not the emulation's."
+  (anvil-stdio-cancel-test--with-fake (dir env bash)
+    (let* ((process-environment (append env process-environment))
+           (output (generate-new-buffer " *anvil-stdio-pid-out*"))
+           (process (make-process :name "anvil-stdio-pid" :buffer output
+                                  :connection-type 'pipe :noquery t
+                                  :command (list bash anvil-stdio-cancel-test--script
+                                                 "--server-id=test")))
+           (pid (process-id process))
+           (deadline (+ (float-time) 30)))
+      (unwind-protect
+          (progn
+            (process-send-string process (anvil-stdio-cancel-test--input
+                                          (anvil-stdio-cancel-test--request 1 "tools/call")
+                                          (anvil-stdio-cancel-test--request 2 "ping")))
+            (process-send-eof process)
+            (while (and (process-live-p process) (< (float-time) deadline))
+              (accept-process-output process 0.1))
+            (should-not (process-live-p process))
+            (let ((expressions (with-temp-buffer
+                                 (insert-file-contents (expand-file-name "expressions" dir))
+                                 (split-string (buffer-string) "\n" t))))
+              (should (= (length expressions) 2))
+              (dolist (expression expressions)
+                (should (string-match "(anvil-server-transport-pid \\([0-9]+\\))" expression))
+                (should (= (string-to-number (match-string 1 expression)) pid)))))
+        (when (process-live-p process)
+          (delete-process process))
+        (kill-buffer output)))))
 
 (defun anvil-stdio-cancel-test--sequence (messages)
   "Return MESSAGES as a list of answered ids and notification methods, in order."

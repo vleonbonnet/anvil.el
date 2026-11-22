@@ -10,11 +10,12 @@
 # FAKE_FIRST_DELAY seconds, so that the input sent with it is waiting
 # for the bridge once it answers.  FAKE_BASE64 and FAKE_SLEEP name the
 # programs it uses, so that it runs on a PATH holding no other.  Each
-# call appends "emacsclient" to `calls' and the request to `requests',
-# beside the script.  With FAKE_TOOLS_COUNTS, counts separated by
-# spaces, a reply to an expression asking for the tool list's count
-# begins with it, as Anvil's does: the Nth call answers the Nth count,
-# and later calls the last.
+# call appends "emacsclient" to `calls', the request to `requests' and
+# the expression to `expressions', beside the script.  With
+# FAKE_TOOLS_COUNTS, counts separated by spaces, a reply to an
+# expression asking for the tool list's count begins with it, as
+# Anvil's does: the Nth call answers the Nth count, and later calls
+# the last.
 
 dir=${0%/*}
 printf 'emacsclient\n' >>"$dir/calls"
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
 	fi
 	shift
 done
+printf '%s\n' "$expr" >>"$dir/expressions"
 b64=${expr#*base64-decode-string \"}
 b64=${b64%%\"*}
 req=$(printf '%s' "$b64" | "$FAKE_BASE64" -d)
