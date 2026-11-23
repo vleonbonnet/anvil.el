@@ -522,15 +522,21 @@ anvil_decode_reply() {
 # anvil_call_emacs EXPR [FILES]
 #
 # Evaluates EXPR, which returns a string encoded in base64, in Emacs,
-# and sets _anvil_reply to that string decoded, and _anvil_client_rc to
-# emacsclient's status.  FILES, the prefix of the files to use, is the
-# main loop's by default.
+# and sets _anvil_reply to that string decoded, _anvil_client_rc to
+# emacsclient's status, and _anvil_client_err to its stderr when it
+# failed (decoding the reply reuses the stderr file).  FILES, the prefix
+# of the files to use, is the main loop's by default.
 anvil_call_emacs() {
 	local files="${2:-$_anvil_main}"
 	anvil_emacsclient_retry "$files" -- \
 		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
 		-e "$1"
 	_anvil_client_rc=$_anvil_rc
+	_anvil_client_err=""
+	if [ "$_anvil_client_rc" != 0 ]; then
+		anvil_read_file "$files.err"
+		_anvil_client_err="$_anvil_file_text"
+	fi
 	mcp_debug_log "EMACSCLIENT-RC" "$_anvil_client_rc"
 	if [ "$_anvil_debug" = 1 ] && [ -s "$files.err" ]; then
 		anvil_read_file "$files.err"
@@ -538,6 +544,91 @@ anvil_call_emacs() {
 	fi
 	mcp_debug_log "BASE64-RESPONSE" "$_anvil_out"
 	anvil_decode_reply "$_anvil_out" "$files"
+}
+
+# --- Requests Emacs could not run yet -----------------------------------
+# emacsclient fails with an Emacs error, not a socket error, while Emacs
+# cannot run a request yet: Anvil is being reloaded, or Emacs is busy
+# with its configuration.  A client pinned to MCP 2026-07-28 takes one
+# failed server/discover for a server that does not speak that revision,
+# and gives up on it for good.  So a request that only reads, the
+# handshake and the lists, is sent again for a while before the bridge
+# answers with an error; a tool call, which may have run in part, is
+# not.  The method counts only when it comes before any nested object,
+# so that a tool call's arguments cannot pass for a list request.
+#
+#   ANVIL_REQUEST_RETRY_MAX        attempts after the first (default 10)
+#   ANVIL_REQUEST_RETRY_DELAY_MS   delay before each (default 1000)
+#   ANVIL_FAILURE_LOG              file recording each failed call, one
+#                                  line each; unset records nothing
+ANVIL_REQUEST_RETRY_MAX=${ANVIL_REQUEST_RETRY_MAX:-10}
+ANVIL_REQUEST_RETRY_DELAY_MS=${ANVIL_REQUEST_RETRY_DELAY_MS:-1000}
+ANVIL_FAILURE_LOG=${ANVIL_FAILURE_LOG:-""}
+_anvil_method_re='^[[:space:]]*[{][^{]*"method"[[:space:]]*:[[:space:]]*"([^"]*)"'
+_anvil_rereadable_re='^(initialize|server/discover|ping|tools/list|resources/list|resources/templates/list|resources/read|prompts/list|prompts/get)$'
+_anvil_emacs_error_re='[*]ERROR[*]'
+
+# anvil_request_method REQUEST
+#
+# Sets `_anvil_method' to the method of REQUEST, or to nothing when it
+# does not come before the request's first nested object.
+anvil_request_method() {
+	_anvil_method=""
+	if [[ $1 =~ $_anvil_method_re ]]; then
+		_anvil_method="${BASH_REMATCH[1]}"
+	fi
+}
+
+# anvil_log_failure REQUEST ATTEMPT
+#
+# Records in ANVIL_FAILURE_LOG that the call for REQUEST failed on its
+# ATTEMPT, numbered from 0, with emacsclient's status and stderr.
+anvil_log_failure() {
+	local err stamp
+	if [ -z "$ANVIL_FAILURE_LOG" ]; then
+		return 0
+	fi
+	err="${_anvil_client_err//$'\r'/}"
+	err="${err//$'\n'/ }"
+	anvil_request_id "$1"
+	anvil_request_method "$1"
+	stamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
+	mkdir -p "${ANVIL_FAILURE_LOG%/*}" 2>/dev/null
+	printf '%s pid=%s server=%s method=%s id=%s attempt=%s rc=%s stderr=%s\n' \
+		"$stamp" "$$" "$SERVER_ID" "${_anvil_method:-?}" "${_anvil_id:-none}" \
+		"$2" "${_anvil_client_rc:-?}" "${err:0:300}" >>"$ANVIL_FAILURE_LOG" 2>/dev/null
+	return 0
+}
+
+# anvil_call_emacs_request EXPR REQUEST
+#
+# Evaluates EXPR, which runs REQUEST, as `anvil_call_emacs' does, and
+# evaluates it again while Emacs answers with an error and REQUEST only
+# reads (see Requests Emacs could not run yet).
+anvil_call_emacs_request() {
+	local attempt=0 delay_sec
+	anvil_call_emacs "$1"
+	while [ -z "$_anvil_reply" ] && [ "${_anvil_client_rc:-0}" != 0 ]; do
+		anvil_log_failure "$2" "$attempt"
+		anvil_request_id "$2"
+		anvil_request_method "$2"
+		if [ "$_anvil_client_rc" != 1 ] ||
+			! [[ $_anvil_client_err =~ $_anvil_emacs_error_re ]] ||
+			[ -z "$_anvil_id" ] || [ "$_anvil_id" = null ] ||
+			! [[ $_anvil_method =~ $_anvil_rereadable_re ]] ||
+			[ "$attempt" -ge "$ANVIL_REQUEST_RETRY_MAX" ]; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		mcp_debug_log "REQUEST-RETRY" "attempt=$attempt method=$_anvil_method id=$_anvil_id"
+		if [ "$ANVIL_REQUEST_RETRY_DELAY_MS" -gt 0 ]; then
+			printf -v delay_sec '%d.%03d' \
+				$((ANVIL_REQUEST_RETRY_DELAY_MS / 1000)) \
+				$((ANVIL_REQUEST_RETRY_DELAY_MS % 1000))
+			sleep "$delay_sec"
+		fi
+		anvil_call_emacs "$1"
+	done
 }
 
 # anvil_pollers_exist
@@ -1013,9 +1104,10 @@ while anvil_read_message; do
 	# The reply starts with the tool list's count (see Tool list changes).
 	elisp_expr="(base64-encode-string (encode-coding-string (concat (if (fboundp 'anvil-server-tools-generation) (format \"anvil-tools:%s\\n\" (anvil-server-tools-generation \"$SERVER_ID\")) \"\") (or (let ((anvil-server-deferrable t) (anvil-server-transport-relists t) (anvil-server-transport-listens t) (anvil-server-transport-pid $_anvil_pid)) (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\")) \"\")) 'utf-8 t) t)"
 
-	# Get response from emacsclient (with retry across daemon restarts).
-	# The rc is for logging only; an empty response is a soft failure.
-	anvil_call_emacs "$elisp_expr"
+	# Get response from emacsclient (with retry across daemon restarts,
+	# and across Emacs errors for a request that only reads).  The rc is
+	# for logging only; an empty response is a soft failure.
+	anvil_call_emacs_request "$elisp_expr" "$line"
 	formatted_response="$_anvil_reply"
 	anvil_take_tools_count
 	_anvil_dropped=0
