@@ -2808,14 +2808,7 @@ Safe for files over 1.2MB."
    :intent '(file-read structure)
    :layer 'core
    :description
-   "Layer 3 of anvil progressive disclosure (see `disclosure-help').
-Read file contents with optional line-based pagination.  Accepts
-either a plain absolute path or a `file://PATH[#L<start>[-<end>]]'
-citation URI emitted by Layer 1 (`file-outline') / Layer 2
-(`file-read-snippet') — the URI's line range becomes the default
-offset/limit.  Returns the file content as a string.  For large
-files, use `file-read-snippet' (Layer 2) or pass offset/limit to
-   read specific sections."
+   "Read a file, by absolute path or a file://PATH#L10-20 citation, with optional offset and limit in lines."
    :read-only t
    :server-id anvil-file--server-id)
 
@@ -2825,14 +2818,7 @@ files, use `file-read-snippet' (Layer 2) or pass offset/limit to
    :intent '(file-read structure)
    :layer 'core
    :description
-   "Read a whole file through a session baseline cache optimized for
-re-reads.  First read returns full content plus a SHA1 hash.  A byte-
-identical re-read returns only mode/hash/size.  A small edit returns a
-unified diff against the last full or delta-updated baseline, plus the
-new hash and the base hash.  Callers apply the diff to their previously
-received full content; when uncertain, pass reset=true to force a fresh
-full baseline.  Oversized files fall back to full mode and are not
-cached."
+   "Read a file through a per-session cache: the first read returns its content and a SHA1 hash, an unchanged file only its hash, and a changed one a unified diff against the last read.  reset=true forces a full read."
    :read-only t
    :server-id anvil-file--server-id)
 
@@ -2865,12 +2851,7 @@ exist; this tool will not create it.  Safe for files over 1.2MB."
    :intent '(file-edit batch)
    :layer 'core
    :description
-   "Execute multiple file operations in a single call.  Most token-efficient
-way to perform bulk edits: N operations in 1 round trip instead of N calls.
-The operations parameter is a JSON array string.  Supported ops:
-replace, replace-regexp, insert-at-line, delete-lines, append, prepend.
-All operations run sequentially on the same buffer and the file is written
-once atomically at the end.  Safe for files over 1.2MB."
+   "Run several operations on one file in one call, writing it once at the end.  operations is a JSON array; ops are replace, replace-regexp, insert-at-line, delete-lines, append and prepend."
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
@@ -2879,16 +2860,7 @@ once atomically at the end.  Safe for files over 1.2MB."
    :intent '(json-edit config)
    :layer 'core
    :description
-   "Add key-value pairs to a top-level JSON object while preserving
-existing formatting.  Designed for i18n dictionaries and config files
-where hundreds of entries must be appended without re-emitting the
-whole file.  Pairs are supplied as a JSON array, e.g.
-\"[[\\\"a\\\",\\\"1\\\"],[\\\"b\\\",\\\"2\\\"]]\".  The function detects
-existing keys and handles duplicates via on-duplicate
-(skip/overwrite/error).  Indentation is auto-detected from the file.
-Trailing-comma and closing-brace handling is automatic.  Only string
-values are supported; for numeric/boolean values fall back to
-file-insert-at-line."
+   "Add string key-value pairs to a top-level JSON object in a file, keeping its formatting.  Pairs come as a JSON array of [key, value] arrays; on-duplicate is skip, overwrite or error."
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
@@ -2965,15 +2937,7 @@ Brace-balance skips strings."
    :intent '(code-bulk-edit)
    :layer 'core
    :description
-   "Add a field to TS/JS object literals by mapping from another field's value.
-For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a single-line `{...}'
-block at PATH, look up VALUE in MAP-JSON and insert `ADD-KEY: \"MAPPED-VALUE\"'
-before the closing `}'.  Targets bulk i18n / schema-extension workflows where
-Read+Write of whole files would dominate token cost.  Default is preview-only;
-pass apply=\"t\" to write the file.  on-existing controls behavior when
-ADD-KEY already exists (error|skip|overwrite, default error).  scope-regex
-restricts edits to substrings matching the pattern.  Returns plist with
-:added :skipped :overwritten :missing :total-matches :dry-run :preview."
+   "In the single-line {...} object literals of a TS/JS file, add a field after each lookup field, its value mapped through a JSON map.  Previews by default; apply=\"t\" writes the file."
    :server-id anvil-file--server-id))
 
 (defun anvil-file-disable ()

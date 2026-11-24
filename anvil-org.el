@@ -2505,36 +2505,7 @@ adding or modifying tags on TODO items."
    :intent '(org-read)
    :layer 'core
    :description
-   "Get the list of Org files accessible through the anvil-org
-server.  Returns the configured allowed files exactly as specified in
-anvil-org-allowed-files.
-
-Parameters: None
-
-Returns JSON object containing:
-  files (array of strings): Absolute paths of allowed Org files
-
-Example response:
-  {
-    \"files\": [
-      \"/home/user/org/tasks.org\",
-      \"/home/user/org/projects.org\",
-      \"/home/user/notes/daily.org\"
-    ]
-  }
-
-Empty configuration returns:
-  {
-    \"files\": []
-  }
-
-Use cases:
-  - Discovery: What Org files can I access through MCP?
-  - URI Construction: I need to build an org-headline:// URI - what's
-    the exact path?
-  - Access Troubleshooting: Why is my file access failing?
-  - Configuration Verification: Did my anvil-org-allowed-files setting
-    work correctly?"
+   "List the Org files these tools may read and edit, as absolute paths."
    :read-only t
    :server-id anvil-org--server-id)
 
@@ -2544,24 +2515,7 @@ Use cases:
    :intent '(org-read agenda)
    :layer 'workflow
    :description
-   "Render an Org agenda view using Emacs' own org-agenda engine and
-return the plain-text agenda buffer.  Use this when the agent needs
-the same scheduled/deadline/TODO view a human would see in Emacs,
-without reimplementing agenda logic.
-
-Parameters:
-  keys - Optional org-agenda dispatcher key (string).  Examples:
-         \"a\" daily/weekly agenda, \"t\" global TODO list, or a
-         custom command key from org-agenda-custom-commands.  Empty
-         means direct org-agenda-list.
-  start_day - Optional YYYY-MM-DD start date for agenda-list views
-  span - Optional positive integer string for number of days
-  files_json - Optional JSON array of Org file paths to bind as
-               org-agenda-files.  Omit to use anvil-org-allowed-files
-               when access restrictions are enabled, otherwise the
-               user's org-agenda-files.
-
-Returns: Plain text agenda output with text properties stripped."
+   "Render an Org agenda view with org-agenda, as Emacs shows it, and return it as plain text."
    :read-only t
    :server-id anvil-org--server-id)
 
@@ -2621,30 +2575,7 @@ Returns JSON object:
    :intent '(org-eval eval)
    :layer 'dev
    :description
-   "Execute one Org Babel source block asynchronously.
-
-Parameters:
-  file - Absolute Org file path.  Required with line; optional with
-         block_name.  When omitted with block_name, Anvil searches the
-         allowed Org files and rejects ambiguous names.
-  line - 1-based line containing the source block.  The line may be
-         the #+name line, source header, body, or #+end_src line.
-  block_name - Named Babel source block.  Mutually exclusive with line.
-
-Before queuing and again before execution, allows buffer-only unsaved
-changes but rejects a conflict where both buffer and disk changed.  Clean
-buffers are reverted from disk.  Buffer navigation is saved, and the block
-runs with Babel confirmation disabled for noninteractive execution.
-
-Returns the job ID string.  Poll with emacs-eval-result.
-The block's normal Babel result handling still applies: results are
-written into the Org buffer.  When that buffer was clean before the run,
-it is saved afterwards; a buffer that already held the user's unsaved
-edits is left unsaved.  The job result plist reports :modified, :saved
-and :vc (version-control backend or nil), plus a :notice string when
-follow-up is needed (commit the saved file, or ask the user to save).
-
-Provide either block_name, or both file and line."
+   "Run one Org Babel source block asynchronously, named by block_name or by file and line, and return a job ID to poll with emacs-eval-result.  Results go into the Org buffer, which is saved afterwards if it was clean; the job's result says what to commit or save."
    :read-only nil
    :server-id anvil-org--server-id)
 
@@ -2654,34 +2585,7 @@ Provide either block_name, or both file and line."
    :intent '(org-edit)
    :layer 'core
    :description
-   "Update the TODO state of an Org headline.  Changes the task state
-while preserving the headline title, tags, and other properties.
-Creates an Org ID property for the headline if one doesn't exist.
-The change runs `org-todo', as when done by hand: a repeating task
-marked done moves to its next date, state hooks run, and the LOGBOOK
-records the change.
-
-Parameters:
-  uri - URI of the headline to update (string, required)
-        Formats:
-          - org-headline://{absolute-path}#{url-encoded-path}
-          - org-id://{uuid}
-  current_state - Expected current TODO state (string, required)
-                  Use empty string \"\" if headline has no TODO state
-                  Must match actual state or tool will error
-  new_state - New TODO state to set (string, required)
-              Must be valid keyword from org-todo-keywords
-  note - Text of the note Org asks for, such as a closing note
-         (string, optional; without it the LOGBOOK entry has the
-         time only)
-
-Returns JSON object:
-  success - Always true on success (boolean)
-  previous_state - The previous TODO state (string, empty for none)
-  new_state - The new TODO state that was set (string)
-  repeated - true when a repeater moved the task to its next date,
-             leaving it in a not-done state (present only then)
-  uri - ID-based URI (org-id://{uuid}) for the updated headline"
+   "Change a headline's TODO state through `org-todo', as by hand: a repeating task marked done moves to its next date, state hooks run, and the LOGBOOK records the change.  current_state must match the headline's state, \"\" for none.  Returns the previous and new states and the headline's org-id:// URI."
    :read-only nil
    :server-id anvil-org--server-id)
 
@@ -2691,50 +2595,7 @@ Returns JSON object:
    :intent '(org-edit)
    :layer 'core
    :description
-   "Add a new TODO item to an Org file at a specified location.
-Creates the headline with TODO state, tags, and optional body content.
-Automatically creates an Org ID property for the new headline.
-
-Parameters:
-  title - Headline text without TODO state or tags (string, required)
-          Cannot be empty or whitespace-only
-          Cannot contain newlines
-  todo_state - TODO keyword from org-todo-keywords (string, required)
-  tags - Tags for the headline (string, required)
-         Single tag: \"urgent\"
-         Multiple tags: JSON array literal, e.g. \"[\\\"work\\\",\\\"urgent\\\"]\"
-         No tags: empty string \"\"
-         Validated against org-tag-alist if configured
-         Must follow Org tag rules (alphanumeric, _, @)
-         Respects mutually exclusive tag groups
-  body - Body content under the headline (string, optional)
-         Cannot contain headlines at same or higher level as new item
-         If #+BEGIN/#+END blocks are present, they must be balanced
-  parent_uri - Parent location (string, required)
-               For top-level: org-headline://{absolute-path}
-               For child: org-headline://{path}#{parent-path}
-                         or org-id://{parent-uuid}
-  after_uri - Sibling to insert after (string, optional)
-              Must be org-id://{uuid} format
-              If omitted, appends as last child of parent
-              For top-level: a top-level heading of the same file
-  position - \"first\" inserts as parent's first child (string, optional)
-             For top-level: before the file's first heading
-             Mutually exclusive with after_uri
-
-Returns JSON object:
-  success - Always true on success (boolean)
-  uri - ID-based URI (org-id://{uuid}) for the new headline
-  file - Filename (not full path) where item was added
-  title - The headline title that was created
-
-Positioning behavior:
-  - With parent_uri only: Appends as last child of parent
-  - With parent_uri + after_uri: Inserts immediately after specified
-sibling
-  - Top-level (parent_uri with no fragment): Adds at end of file;
-position and after_uri apply as for children.  Text before the first
-heading (keywords, a file-level property drawer) is never split."
+   "Add a TODO headline under parent_uri, as its last child unless after_uri or position says otherwise, with tags and an optional body, and give it an Org ID.  Returns the new headline's org-id:// URI."
    :read-only nil
    :server-id anvil-org--server-id)
 
@@ -2744,28 +2605,7 @@ heading (keywords, a file-level property drawer) is never split."
    :intent '(org-edit)
    :layer 'core
    :description
-   "Rename an Org headline's title while preserving its TODO state,
-tags, properties, and body content.  Creates an Org ID property for
-the headline if one doesn't exist.
-
-Parameters:
-  uri - URI of the headline to rename (string, required)
-        Formats:
-          - org-headline://{absolute-path}#{url-encoded-path}
-          - org-id://{uuid}
-  current_title - Expected current title without TODO/tags (string,
-required)
-                  Must match actual title or tool will error
-                  Used to prevent race conditions
-  new_title - New title without TODO state or tags (string, required)
-              Cannot be empty or whitespace-only
-              Cannot contain newlines
-
-Returns JSON object:
-  success - Always true on success (boolean)
-  previous_title - The previous headline title (string)
-  new_title - The new title that was set (string)
-  uri - ID-based URI (org-id://{uuid}) for the renamed headline"
+   "Rename a headline, keeping its TODO state, tags, properties and body.  current_title must match its present title.  Returns the old and new titles and the headline's org-id:// URI."
    :read-only nil
    :server-id anvil-org--server-id)
 
@@ -2775,35 +2615,7 @@ Returns JSON object:
    :intent '(org-edit)
    :layer 'core
    :description
-   "Edit the body content of an Org headline using partial string
-replacement.  Finds and replaces a substring within the headline's
-body text.  Creates an Org ID property for the headline if one doesn't
-exist.
-
-Parameters:
-  resource_uri - URI of the headline to edit (string, required)
-                 Formats:
-                   - org-headline://{absolute-path}#{url-encoded-path}
-                   - org-id://{uuid}
-  old_body - Substring to find and replace (string, required)
-             Must appear exactly once unless replace_all is true
-             Use empty string \"\" only for adding to empty nodes
-  new_body - Replacement text (string, required)
-             Cannot introduce headlines at same or higher level
-             Must maintain balanced #+BEGIN/#+END blocks
-  replace_all - Replace all occurrences (boolean, optional, default
-                false). When false, old_body must be unique in the
-                body.
-
-Returns JSON object:
-  success - Always true on success (boolean)
-  uri - ID-based URI (org-id://{uuid}) for the edited headline
-
-Special behavior - Empty old_body:
-  When old_body is \"\", the tool adds content to empty nodes:
-  - Only works if node body is empty or whitespace-only
-  - Error if node already has content
-  - Useful for adding initial content to newly created headlines"
+   "Replace a substring of a headline's body, once unless replace_all is true.  An empty old_body adds text to an empty body only.  The new text cannot add headlines at the headline's level or above.  Returns the headline's org-id:// URI."
    :read-only nil
    :server-id anvil-org--server-id)
 
@@ -2847,21 +2659,7 @@ Returns: JSON object with hierarchical outline structure"
    :intent '(org-read)
    :layer 'core
    :description
-   "Read specific Org headline by hierarchical path. Returns headline
-   with TODO state, tags, properties, body text, and all nested
-   subheadings. File must be in anvil-org-allowed-files.
-
-Parameters:
-  file - Absolute path to Org file (string, required)
-  headline_path - Non-empty slash-separated path to headline (string,
-                  required). Only slashes (/) in  headline titles must
-                  be encoded as %2F
-                  Example: \"Project/Planning\" for nested headlines
-                  Example: \"A%2FB Testing\" for headline titled
-                  \"A/B Testing\"
-                  To read entire files, use org-read-file instead
-
-Returns: Plain text content of the headline and its subtree"
+   "Read a headline and its subtree by its path in file: titles joined with /, a / inside a title written %2F.  For a whole file, use org-read-file."
    :read-only t
    :server-id anvil-org--server-id)
 
@@ -2871,27 +2669,7 @@ Returns: Plain text content of the headline and its subtree"
    :intent '(org-read)
    :layer 'core
    :description
-   "Layer 3 of anvil progressive disclosure (see `disclosure-help').
-Read Org headline by its unique ID property.  More stable than
-path-based access since IDs don't change when headlines are renamed
-or moved.  Accepts the raw UUID directly or the `org://UUID' citation
-URI returned by Layer 1 (`org-index-index') / Layer 2
-(`org-index-search').  The `org-id://UUID' form is the MCP resource
-URI, not the input format for this tool.  File containing the ID must
-be in anvil-org-allowed-files.
-
-Parameters:
-  uuid - UUID (or org://UUID citation URI) from headline's ID
-         property (string, required)
-  max_depth - Optional integer string capping the included heading
-              depth relative to the target heading.  \"1\" (default)
-              returns the heading and its body only; \"2\" adds
-              immediate children; \"0\" or negative returns the full
-              subtree.
-
-Returns: Plain text content of the bounded subtree followed by a
-\"------ Child headlines (N) ------\" footer naming the immediate
-children, so the caller knows which subtrees to descend into next"
+   "Read a headline by its ID: the raw UUID or an org://UUID citation, not an org-id:// URI.  Returns the headline and its body, then its children's titles; max_depth includes deeper levels."
    :read-only t
    :server-id anvil-org--server-id)
 
